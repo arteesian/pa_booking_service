@@ -1,0 +1,111 @@
+name: pa_booking
+
+# Прод-связка pa_booking_service. Паттерн — как у pa_stats/auth_service/kpd_service:
+#   - Postgres ВНЕШНИЙ (на хосте): контейнеры ходят через host.docker.internal
+#     по PA_BOOKING_DATABASE_URL из ../.env. ВАЖНО: host в DSN должен быть
+#     host.docker.internal (а не localhost/127.0.0.1) — иначе контейнер не
+#     достучится до БД хоста.
+#   - Redis поднимаем здесь (только для Celery: broker + RedBeat-lock).
+#   - Меш BFF↔pa_booking↔auth — по внешней сети pa_net (алиасы). API наружу
+#     не публикуется: его дёргает только BFF по pa_net (алиас booking-api).
+#   - Миграции — отдельный сервис под профилем tools, запускается руками ДО
+#     рестарта api. Автонакат в entrypoint не делаем: при нескольких репликах
+#     это гонка за блокировку Alembic, а откат становится неуправляемым.
+#
+# Сеть создаётся один раз (обычно уже есть от auth/bff):
+#   docker network create pa_net
+#
+# Порядок выката:
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml --profile tools run --rm migrate
+#   docker compose -f docker/docker-compose.yml up -d redis worker beat
+#   docker compose -f docker/docker-compose.yml up -d api
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - "redis_data:/data"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    env_file:
+      - ../.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    profiles: ["tools"]
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command:
+      - "uvicorn"
+      - "pa_booking.app:app"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+    env_file:
+      - ../.env
+    # Host-порт не публикуем: API дёргает только BFF по pa_net (booking-api:8000).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # доступ к БД хоста
+    networks:
+      default: {}
+      pa_net:
+        aliases: ["booking-api"]
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["celery", "-A", "pa_booking.workers.celery_app:celery_app", "worker",
+              "-Q", "pa_booking", "--concurrency=1", "--loglevel=info"]
+    env_file:
+      - ../.env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # доступ к БД хоста
+    networks:
+      # pa_net нужен воркеру для синка ростера: ходит в auth по внутренней сети
+      # (PA_BOOKING_AUTH_BASE_URL=http://auth-api:8000), т.к. host-порт auth
+      # слушает только 127.0.0.1 и через гейтвей недоступен.
+      # Алиас — чтобы Prometheus скрейпил embedded-экспортёр booking-worker:9100.
+      default: {}
+      pa_net:
+        aliases: ["booking-worker"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["celery", "-A", "pa_booking.workers.celery_app:celery_app", "beat",
+              "--scheduler=redbeat.RedBeatScheduler", "--loglevel=info"]
+    env_file:
+      - ../.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data: {}
+
+networks:
+  pa_net:
+    external: true
