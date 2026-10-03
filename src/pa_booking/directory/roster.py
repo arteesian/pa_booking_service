@@ -24,6 +24,12 @@ class HttpClient(Protocol):
     def get(self, path: str, *, headers: dict[str, str]) -> tuple[int, bytes]: ...
 
 
+class ClosableHttpClient(HttpClient, Protocol):
+    """Клиент с пулом соединений: владелец обязан закрыть его после использования."""
+
+    def close(self) -> None: ...
+
+
 class RosterPerson(BaseModel):
     """Сотрудник из ростера."""
 
@@ -53,7 +59,7 @@ def fetch_roster_snapshot(client: HttpClient, *, api_key: str) -> RosterSnapshot
         raise DirectoryFetchError(f"неожиданная схема ответа roster API: {exc}") from exc
 
 
-def make_httpx_client(base_url: str, *, timeout: float = 30.0) -> HttpClient:
+def make_httpx_client(base_url: str, *, timeout: float = 30.0) -> ClosableHttpClient:
     """Production-клиент на httpx."""
     import httpx
 
@@ -64,5 +70,8 @@ def make_httpx_client(base_url: str, *, timeout: float = 30.0) -> HttpClient:
         def get(self, path: str, *, headers: dict[str, str]) -> tuple[int, bytes]:
             resp = self._client.get(path, headers=headers)
             return resp.status_code, resp.content
+
+        def close(self) -> None:
+            self._client.close()
 
     return _HttpxClient()

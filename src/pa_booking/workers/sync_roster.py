@@ -54,12 +54,13 @@ def sync_roster() -> int:
     """Задача Celery. Сбой auth логируем и выходим: сервис живёт на старом снимке."""
     settings = get_settings()
     engine = make_engine_from_settings(settings)
+    client = make_httpx_client(settings.auth_base_url)
     started = time.monotonic()
     try:
         with make_sessionmaker(engine)() as session:
             count = sync_roster_once(
                 session,
-                make_httpx_client(settings.auth_base_url),
+                client,
                 api_key=settings.auth_api_key.get_secret_value(),
                 now=datetime.now(UTC),
             )
@@ -82,4 +83,6 @@ def sync_roster() -> int:
         return count
     finally:
         roster_sync_duration_seconds.observe(time.monotonic() - started)
+        # Воркер долгоживущий, задача — раз в 15 минут: пул соединений не копим.
+        client.close()
         engine.dispose()

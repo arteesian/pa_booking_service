@@ -1,12 +1,25 @@
-"""ORM-модели. Пока только снимок директории; домен — в блоках 2–3."""
+"""ORM-модели: снимок директории и записи. Библиотека — в блоке 3."""
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time
+from enum import StrEnum
 
-from sqlalchemy import CheckConstraint, DateTime, String, func, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    String,
+    func,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from pa_booking.domain.appointments import BookingStatus, Kind
 
 
 class Base(DeclarativeBase):
@@ -40,3 +53,64 @@ class DirectorySyncState(Base):
     employees_count: Mapped[int] = mapped_column(nullable=False, server_default=text("0"))
 
     __table_args__ = (CheckConstraint("id = 1", name="ck_directory_sync_state_singleton"),)
+
+
+def _pg_enum(enum_cls: type[StrEnum], name: str) -> Enum:
+    """PostgreSQL ENUM из значений StrEnum (``"psy"``), а не имён членов (``"PSY"``)."""
+    return Enum(enum_cls, name=name, values_callable=lambda cls: [m.value for m in cls])
+
+
+class AppointmentSlot(Base):
+    """Слот специалиста: дата и время по МСК. Удаление мягкое — история для выгрузок."""
+
+    __tablename__ = "appointment_slots"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    slot_date: Mapped[date] = mapped_column(nullable=False)
+    slot_time: Mapped[time] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # Одна неудалённая пара (дата, время); после удаления то же время можно добавить снова.
+        Index(
+            "uq_appointment_slots_active",
+            "slot_date",
+            "slot_time",
+            unique=True,
+            postgresql_where=text("removed_at IS NULL"),
+        ),
+    )
+
+
+class AppointmentBooking(Base):
+    """Бронь слота сотрудником. Отменённые остаются — для «Моих записей» и выгрузок."""
+
+    __tablename__ = "appointment_bookings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    slot_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("appointment_slots.id"), nullable=False
+    )
+    employee_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    kind: Mapped[Kind] = mapped_column(_pg_enum(Kind, "appointment_kind"), nullable=False)
+    status: Mapped[BookingStatus] = mapped_column(
+        _pg_enum(BookingStatus, "appointment_status"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # Защита от гонки: второй одновременный INSERT активной брони на слот → IntegrityError.
+        Index(
+            "uq_appointment_bookings_active_slot",
+            "slot_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index("ix_appointment_bookings_employee", "employee_id", "status"),
+    )

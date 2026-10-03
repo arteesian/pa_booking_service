@@ -71,8 +71,14 @@ SPA ──Bearer──> pa_bff ──X-API-Key + X-User-Id/Roles──> pa_booki
 вебхуки не нужны — аккаунты только отправляют. Настройки на модуль:
 `PA_BOOKING_APPOINTMENTS_BOT_ID`, `..._BOT_SECRET`, `..._NOTIFY_CHAT_ID` и
 аналогичные `PA_BOOKING_LIBRARY_*`, плюс общий `PA_BOOKING_BOTX_CTS_URL`.
-**Не проверено:** работает ли pybotx `send_message` у бота, который не принимает
-вебхуки (§8, шаг 0).
+
+Отправка (решение 2026-10-03) — без pybotx: синхронный `POST
+/api/v4/botx/notifications/direct/sync` с JWT бота, как в сервисе `express_notif`.
+JWT (HS256, формат как `pybotx.auth.build_botx_jwt_v2`) подписываем через **`pyjwt`** —
+согласованное исключение из правила «`pyjwt` не заводим»: правило про валидацию
+пользовательского JWT, здесь — подпись исходящих запросов бота.
+**Открыто:** наш BotX отвечает на `/direct/sync` `HTTP 204` без тела — считать ли это
+доставкой (см. «Открытые вопросы» в плане реализации).
 
 ## 4. Модель данных и правила
 

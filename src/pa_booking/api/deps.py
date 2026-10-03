@@ -1,8 +1,9 @@
-"""Общие зависимости FastAPI: сессия БД и принципал."""
+"""Общие зависимости FastAPI: сессия БД, принципал, текущее время."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -22,7 +23,13 @@ def get_session(request: Request) -> Iterator[Session]:
         yield session
 
 
+def get_now() -> datetime:
+    """Текущее время запроса. Тесты подменяют зависимость — без патчинга часов."""
+    return datetime.now(UTC)
+
+
 DbSession = Annotated[Session, Depends(get_session)]
 Principal = Annotated[MeshPrincipal, Depends(get_current_user)]
 PsychologistPrincipal = Annotated[MeshPrincipal, Depends(require_role(Role.PSYCHOLOGIST))]
 LibrarianPrincipal = Annotated[MeshPrincipal, Depends(require_role(Role.LIBRARIAN))]
+Now = Annotated[datetime, Depends(get_now)]

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from celery import Celery
+from celery.schedules import crontab
 
 from pa_booking.core.config import Settings, get_settings
 from pa_booking.workers import metrics_server  # noqa: F401  # connects worker_process_init
@@ -18,7 +19,10 @@ from pa_booking.workers import metrics_server  # noqa: F401  # connects worker_p
 # Модули с задачами. Без них воркер, запущенный по ``-A ...celery_app``, не
 # импортирует sync_roster, и задача останется незарегистрированной: beat её
 # опубликует, а воркер ответит «Received unregistered task».
-TASK_MODULES = ["pa_booking.workers.sync_roster"]
+TASK_MODULES = [
+    "pa_booking.workers.sync_roster",
+    "pa_booking.workers.appointments_cleanup",
+]
 
 
 def make_celery_app(settings: Settings) -> Celery:
@@ -45,7 +49,12 @@ def make_celery_app(settings: Settings) -> Celery:
             "sync-roster": {
                 "task": "pa_booking.sync_roster",
                 "schedule": float(settings.roster_sync_interval_s),
-            }
+            },
+            # crontab — в зоне timezone выше, то есть 14:00 по Москве.
+            "appointments-cleanup": {
+                "task": "pa_booking.appointments_cleanup",
+                "schedule": crontab(hour=14, minute=0),
+            },
         },
     )
     return app

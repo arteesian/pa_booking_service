@@ -1776,11 +1776,542 @@ def sync_roster_once(
 
 ---
 
-## Блок 2. Модуль записей — скоуп
+## Блок 2. Модуль записей
 
-Домен §4.1 (лимит 4/месяц, замок 14:00 МСК, отмены, обзор ±3 дня; Д-8, Д-9),
-таблицы с частичными уникальными индексами, API §5.1, чистка 14:00 + догоняющий
-прогон, уведомления §5.5 через `notify_safely`, `export/xlsx.py` + выгрузки.
+**Итог:** записи к психологу/МКР работают через API §5.1: свободные слоты, запись с
+лимитом 4/месяц, отмена с замком 14:00 МСК, «мои записи», обзор/добавление/удаление
+слотов специалистом, ежедневная чистка 14:00, уведомления §5.5, xlsx-выгрузки.
+
+**Как расписан блок.** Бизнес-правила (Task 2.1) — полностью, кодом и тестами: здесь
+цена ошибки максимальна. Для БД, API и воркера (Task 2.2–2.6) — точные сигнатуры,
+SQL-подход и перечень тест-кейсов с ожидаемым результатом; код показываю по ходу
+реализации (так договорились: пользователь видит каждую правку).
+
+**Сверено с ботом** (`projects/psy_bot_v2`): лимит считает все непустые записи месяца
+даты слота, прошедшие тоже (`database.py:324-335`) — у нас «активные со `slot_date` в
+месяце слота», то же самое; отмена на сегодня после 14:00 удаляет слот
+(`schedule_utils.py:38-40`); чистка — свободные слоты сегодняшней даты, текст
+уведомления (`slot_cleanup.py:18-34`), догоняющий прогон при старте после 14:00;
+обзор специалиста — месяц ± 3 дня (`schedule_utils.py:73-87`). Отличия от бота —
+только из спеки: Д-1, Д-2, Д-6, Д-8, Д-9 и «свободный = начало > now» (§4.1; бот
+показывал свободные слоты сегодняшней даты и после их времени).
+
+**Решения блока:**
+- Гонки — в БД (CLAUDE.md): занятость слота — частичный уникальный индекс; запись,
+  отмена, удаление и чистка берут `SELECT … FOR UPDATE` на строку слота, поэтому
+  «специалист удаляет слот» и «пользователь записывается» не проскакивают друг мимо
+  друга. Лимит 4/месяц индексом не выразить — запись берёт
+  `pg_advisory_xact_lock` по `employee_id`: две параллельные записи одного человека
+  на разные слоты идут по очереди.
+- Ошибки домена — `DomainError(code, detail)`; HTTP-статус выбирает API:
+  409 для `slot_unavailable`, `monthly_limit`, `too_late_to_cancel`, `slot_in_past`;
+  422 для `slot_date_in_past` (Д-8: «422»).
+- Уточнения при реализации: `DomainError` → HTTP одним обработчиком в
+  `core/errors.py` (по умолчанию 409); неизвестный слот при записи/удалении и отмена
+  неактивной брони → 404 `not_found`; добавление слотов → 200; `my_bookings` берёт
+  `since` (дата МСК), точный фильтр «начало ≥ now» — доменом.
+- Догоняющая чистка при старте воркера после 14:00 удалит и свободные слоты, которые
+  специалист добавил сегодня после 14:00, — как в боте (там то же при рестарте).
+
+### Task 2.1: домен записей
+
+**Files:**
+- Create: `src/pa_booking/domain/errors.py`, `src/pa_booking/domain/appointments.py`
+- Test: `tests/unit/test_domain_appointments.py`
+
+**Interfaces:**
+- Produces: `DomainError(code: str, detail: str)`; `MSK`, `LOCK_TIME = time(14, 0)`,
+  `MONTHLY_LIMIT = 4`; `Kind(StrEnum)` {`psy`, `mkr`}; `BookingStatus(StrEnum)`
+  {`active`, `cancelled_by_user`, `cancelled_by_specialist`}; `SlotState(slot_date,
+  slot_time, removed: bool, booked: bool)`; `slot_start(d, t) -> datetime`;
+  `ensure_bookable(slot, *, active_in_month, now)`; `CancelEffect`,
+  `cancel_effect(d, t, *, now)`; `validate_new_slots(d, times, *, now) ->
+  tuple[time, ...]`; `DeleteEffect`, `delete_effect(slot, *, now)`;
+  `cleanup_date(now) -> date | None`; `month_bounds(year, month) -> (date, date)`;
+  `overview_range(year, month) -> (date, date)`; `is_upcoming(d, t, *, now) -> bool`;
+  тексты `text_booked`, `text_cancelled_by_user`, `text_slot_removed`, `text_cleanup`.
+
+Все `now` — aware `datetime` в любой зоне: правила сами переводят в МСК. Это и есть
+главный тест-класс: «11:00 UTC = 14:00 МСК».
+
+- [ ] **Step 1: падающие тесты** — `tests/unit/test_domain_appointments.py`
+
+```python
+from __future__ import annotations
+
+from datetime import UTC, date, datetime, time
+
+import pytest
+
+from pa_booking.domain.appointments import (
+    MSK,
+    CancelEffect,
+    DeleteEffect,
+    Kind,
+    SlotState,
+    cancel_effect,
+    cleanup_date,
+    delete_effect,
+    ensure_bookable,
+    is_upcoming,
+    month_bounds,
+    overview_range,
+    text_booked,
+    text_cancelled_by_user,
+    text_cleanup,
+    text_slot_removed,
+    validate_new_slots,
+)
+from pa_booking.domain.errors import DomainError
+
+D = date(2026, 10, 5)
+
+
+def msk(h: int, m: int = 0, d: date = D) -> datetime:
+    return datetime(d.year, d.month, d.day, h, m, tzinfo=MSK)
+
+
+def slot(t: time = time(16, 0), d: date = D, *, removed: bool = False, booked: bool = False) -> SlotState:
+    return SlotState(slot_date=d, slot_time=t, removed=removed, booked=booked)
+
+
+def code_of(exc: pytest.ExceptionInfo[DomainError]) -> str:
+    return exc.value.code
+
+
+# --- запись ---
+
+
+def test_free_future_slot_is_bookable_below_limit() -> None:
+    ensure_bookable(slot(), active_in_month=3, now=msk(10))
+
+
+def test_fourth_active_booking_in_month_hits_limit() -> None:
+    with pytest.raises(DomainError) as exc:
+        ensure_bookable(slot(), active_in_month=4, now=msk(10))
+    assert code_of(exc) == "monthly_limit"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [slot(removed=True), slot(booked=True), slot(t=time(10, 0))],
+    ids=["removed", "booked", "started"],
+)
+def test_unavailable_slots(state: SlotState) -> None:
+    with pytest.raises(DomainError) as exc:
+        ensure_bookable(state, active_in_month=0, now=msk(10))
+    assert code_of(exc) == "slot_unavailable"
+
+
+def test_slot_starting_exactly_now_is_not_bookable() -> None:
+    with pytest.raises(DomainError):
+        ensure_bookable(slot(t=time(16, 0)), active_in_month=0, now=msk(16))
+
+
+def test_unavailable_checked_before_limit() -> None:
+    """Занятый слот — «недоступен», даже если лимит тоже исчерпан."""
+    with pytest.raises(DomainError) as exc:
+        ensure_bookable(slot(booked=True), active_in_month=4, now=msk(10))
+    assert code_of(exc) == "slot_unavailable"
+
+
+# --- отмена пользователем (Д-2, замок 14:00) ---
+
+
+def test_cancel_today_before_14_frees_slot() -> None:
+    assert cancel_effect(D, time(16, 0), now=msk(13, 59)) is CancelEffect.FREE_SLOT
+
+
+def test_cancel_today_at_14_removes_slot() -> None:
+    assert cancel_effect(D, time(16, 0), now=msk(14, 0)) is CancelEffect.REMOVE_SLOT
+
+
+def test_lock_uses_moscow_time_not_utc() -> None:
+    """11:00 UTC = 14:00 МСК — замок уже действует."""
+    now = datetime(2026, 10, 5, 11, 0, tzinfo=UTC)
+    assert cancel_effect(D, time(16, 0), now=now) is CancelEffect.REMOVE_SLOT
+
+
+def test_cancel_tomorrow_after_14_frees_slot() -> None:
+    tomorrow = date(2026, 10, 6)
+    assert cancel_effect(tomorrow, time(16, 0), now=msk(15)) is CancelEffect.FREE_SLOT
+
+
+def test_cancel_after_start_is_too_late() -> None:
+    with pytest.raises(DomainError) as exc:
+        cancel_effect(D, time(16, 0), now=msk(16, 0))
+    assert code_of(exc) == "too_late_to_cancel"
+
+
+# --- слоты специалиста (Д-8, Д-9) ---
+
+
+def test_new_slots_in_past_date_rejected() -> None:
+    with pytest.raises(DomainError) as exc:
+        validate_new_slots(date(2026, 10, 4), [time(16, 0)], now=msk(10))
+    assert code_of(exc) == "slot_date_in_past"
+
+
+def test_new_slots_today_after_14_allowed_and_deduplicated() -> None:
+    times = validate_new_slots(D, [time(19, 0), time(16, 0), time(19, 0)], now=msk(15))
+    assert times == (time(16, 0), time(19, 0))
+
+
+def test_delete_free_slot_even_in_past() -> None:
+    assert delete_effect(slot(t=time(10, 0)), now=msk(12)) is DeleteEffect.REMOVE_FREE
+
+
+def test_delete_booked_future_slot_cancels_booking() -> None:
+    assert delete_effect(slot(booked=True), now=msk(12)) is DeleteEffect.REMOVE_AND_CANCEL
+
+
+def test_delete_booked_started_slot_refused() -> None:
+    with pytest.raises(DomainError) as exc:
+        delete_effect(slot(t=time(10, 0), booked=True), now=msk(12))
+    assert code_of(exc) == "slot_in_past"
+
+
+# --- чистка 14:00 и календарь ---
+
+
+def test_cleanup_not_due_before_14() -> None:
+    assert cleanup_date(msk(13, 59)) is None
+
+
+def test_cleanup_due_from_14_for_today_in_moscow() -> None:
+    assert cleanup_date(msk(14, 0)) == D
+    # 22:30 UTC 5-го — уже 01:30 МСК 6-го: до 14:00 нового дня чистка не нужна.
+    assert cleanup_date(datetime(2026, 10, 5, 22, 30, tzinfo=UTC)) is None
+
+
+def test_month_bounds_handle_february_and_december() -> None:
+    assert month_bounds(2027, 2) == (date(2027, 2, 1), date(2027, 2, 28))
+    assert month_bounds(2026, 12) == (date(2026, 12, 1), date(2026, 12, 31))
+
+
+def test_overview_is_month_plus_minus_three_days() -> None:
+    assert overview_range(2027, 3) == (date(2027, 2, 26), date(2027, 4, 3))
+
+
+def test_upcoming_includes_slot_starting_now() -> None:
+    assert is_upcoming(D, time(16, 0), now=msk(16, 0))
+    assert not is_upcoming(D, time(16, 0), now=msk(16, 1))
+
+
+# --- тексты §5.5 ---
+
+
+def test_notification_texts() -> None:
+    assert text_booked("Иванов Иван", D, time(16, 0), Kind.MKR) == (
+        "✅ Иванов Иван\nЗаписался на 05.10.2026 в 16:00\nКонсультация МКР"
+    )
+    assert text_cancelled_by_user("Иванов Иван", D, time(9, 30), Kind.PSY) == (
+        "❌ Иванов Иван\nОтменил запись на 05.10.2026 в 09:30\nПсихолог"
+    )
+    assert text_slot_removed("Иванов Иван", D, time(16, 0)) == (
+        "Слот 05.10.2026 — 16:00 был удалён, запись Иванов Иван отменена"
+    )
+    assert text_cleanup([time(17, 0), time(16, 0)]) == (
+        "Свободные окна на сегодня 16:00, 17:00 были удалены"
+    )
+```
+
+Run: `pytest tests/unit/test_domain_appointments.py -q` → FAIL (нет модулей).
+
+- [ ] **Step 2: `src/pa_booking/domain/errors.py`**
+
+```python
+"""Ошибка бизнес-правила. HTTP-статус по ``code`` выбирает слой API."""
+
+from __future__ import annotations
+
+
+class DomainError(Exception):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+```
+
+- [ ] **Step 3: `src/pa_booking/domain/appointments.py`**
+
+```python
+"""Правила записей к психологу и на консультацию МКР (спека §4.1).
+
+Чистый модуль: без БД и HTTP. Текущее время — параметр ``now`` (aware datetime в любой
+зоне); «сегодня», 14:00 и границы месяца считаются по Москве. Слот хранит дату и
+время по МСК без зоны.
+"""
+
+from __future__ import annotations
+
+import calendar
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
+from enum import StrEnum
+from zoneinfo import ZoneInfo
+
+from pa_booking.domain.errors import DomainError
+
+MSK = ZoneInfo("Europe/Moscow")
+# С 14:00 МСК свободные слоты на сегодня удаляются, а отмена записи на сегодня
+# удаляет слот, а не освобождает его (как в боте: schedule_utils.py:33-40).
+LOCK_TIME = time(14, 0)
+MONTHLY_LIMIT = 4
+OVERVIEW_MARGIN = timedelta(days=3)
+
+
+class Kind(StrEnum):
+    PSY = "psy"
+    MKR = "mkr"
+
+
+KIND_TITLES: dict[Kind, str] = {Kind.PSY: "Психолог", Kind.MKR: "Консультация МКР"}
+
+
+class BookingStatus(StrEnum):
+    ACTIVE = "active"
+    CANCELLED_BY_USER = "cancelled_by_user"
+    CANCELLED_BY_SPECIALIST = "cancelled_by_specialist"
+
+
+@dataclass(frozen=True)
+class SlotState:
+    slot_date: date
+    slot_time: time
+    removed: bool
+    booked: bool  # есть активная бронь
+
+
+class CancelEffect(StrEnum):
+    FREE_SLOT = "free_slot"
+    REMOVE_SLOT = "remove_slot"
+
+
+class DeleteEffect(StrEnum):
+    REMOVE_FREE = "remove_free"
+    REMOVE_AND_CANCEL = "remove_and_cancel"
+
+
+def slot_start(slot_date: date, slot_time: time) -> datetime:
+    return datetime.combine(slot_date, slot_time, tzinfo=MSK)
+
+
+def _msk(now: datetime) -> datetime:
+    return now.astimezone(MSK)
+
+
+def ensure_bookable(slot: SlotState, *, active_in_month: int, now: datetime) -> None:
+    """Можно ли записаться. Лимит — активные брони в месяце даты слота (вкл. прошедшие)."""
+    if slot.removed or slot.booked or slot_start(slot.slot_date, slot.slot_time) <= now:
+        raise DomainError("slot_unavailable", "Слот недоступен для записи")
+    if active_in_month >= MONTHLY_LIMIT:
+        raise DomainError(
+            "monthly_limit", f"В этом месяце уже {MONTHLY_LIMIT} записи — больше нельзя"
+        )
+
+
+def cancel_effect(slot_date: date, slot_time: time, *, now: datetime) -> CancelEffect:
+    """Что происходит со слотом при отмене пользователем (Д-2: только до начала)."""
+    if slot_start(slot_date, slot_time) <= now:
+        raise DomainError("too_late_to_cancel", "Запись уже началась — отменить нельзя")
+    local = _msk(now)
+    if slot_date == local.date() and local.time() >= LOCK_TIME:
+        return CancelEffect.REMOVE_SLOT
+    return CancelEffect.FREE_SLOT
+
+
+def validate_new_slots(
+    slot_date: date, times: Iterable[time], *, now: datetime
+) -> tuple[time, ...]:
+    """Д-8: дата не раньше сегодня. Слот на сегодня после 14:00 разрешён (как в боте)."""
+    if slot_date < _msk(now).date():
+        raise DomainError("slot_date_in_past", "Нельзя добавить слоты на прошедшую дату")
+    return tuple(sorted(set(times)))
+
+
+def delete_effect(slot: SlotState, *, now: datetime) -> DeleteEffect:
+    """Д-9: занятый и уже начавшийся слот не удаляется — встреча состоялась."""
+    if not slot.booked:
+        return DeleteEffect.REMOVE_FREE
+    if slot_start(slot.slot_date, slot.slot_time) <= now:
+        raise DomainError("slot_in_past", "Занятый слот уже начался — удалить нельзя")
+    return DeleteEffect.REMOVE_AND_CANCEL
+
+
+def cleanup_date(now: datetime) -> date | None:
+    """Дата, чьи свободные слоты пора удалить; None — до 14:00 МСК чистить нечего."""
+    local = _msk(now)
+    return local.date() if local.time() >= LOCK_TIME else None
+
+
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, 1), date(year, month, last_day)
+
+
+def overview_range(year: int, month: int) -> tuple[date, date]:
+    """Обзор специалиста: месяц ± 3 дня соседних (как в боте)."""
+    first, last = month_bounds(year, month)
+    return first - OVERVIEW_MARGIN, last + OVERVIEW_MARGIN
+
+
+def is_upcoming(slot_date: date, slot_time: time, *, now: datetime) -> bool:
+    """«Мои записи»: начало слота ≥ now."""
+    return slot_start(slot_date, slot_time) >= now
+
+
+def _date_time(slot_date: date, slot_time: time) -> tuple[str, str]:
+    return slot_date.strftime("%d.%m.%Y"), slot_time.strftime("%H:%M")
+
+
+def text_booked(name: str, slot_date: date, slot_time: time, kind: Kind) -> str:
+    d, t = _date_time(slot_date, slot_time)
+    return f"✅ {name}\nЗаписался на {d} в {t}\n{KIND_TITLES[kind]}"
+
+
+def text_cancelled_by_user(name: str, slot_date: date, slot_time: time, kind: Kind) -> str:
+    d, t = _date_time(slot_date, slot_time)
+    return f"❌ {name}\nОтменил запись на {d} в {t}\n{KIND_TITLES[kind]}"
+
+
+def text_slot_removed(name: str, slot_date: date, slot_time: time) -> str:
+    d, t = _date_time(slot_date, slot_time)
+    return f"Слот {d} — {t} был удалён, запись {name} отменена"
+
+
+def text_cleanup(times: Iterable[time]) -> str:
+    listed = ", ".join(t.strftime("%H:%M") for t in sorted(times))
+    return f"Свободные окна на сегодня {listed} были удалены"
+```
+
+- [ ] **Step 4:** `pytest tests/unit/test_domain_appointments.py -q` → PASS; `ruff check . && mypy src`.
+
+- [ ] **Step 5: коммит** — `feat(appointments): add booking rules domain`
+
+### Task 2.2: таблицы записей и миграция
+
+**Files:** Modify `src/pa_booking/db/models.py`; Create `alembic/versions/0002_appointments.py`;
+Test `tests/integration/test_appointments_schema.py` (`db`).
+
+**Interfaces:** `AppointmentSlot(id, slot_date, slot_time, created_at, removed_at)`,
+`AppointmentBooking(id, slot_id, employee_id, kind, status, created_at, cancelled_at)` —
+ровно §4.1 спеки; `kind`/`status` — PostgreSQL ENUM `appointment_kind`,
+`appointment_status` из `Kind`/`BookingStatus` (значения, не имена членов).
+Индексы: `uq_appointment_slots_active (slot_date, slot_time) WHERE removed_at IS NULL`,
+`uq_appointment_bookings_active_slot (slot_id) WHERE status = 'active'`,
+`ix_appointment_bookings_employee (employee_id, status)`.
+
+Тесты (`db`): вторая неудалённая пара `(дата, время)` → `IntegrityError`, а после
+`removed_at` у первой — вставляется; вторая активная бронь на слот → `IntegrityError`,
+а `cancelled_by_user` + `active` на один слот — можно; колонки миграции = модели
+(уже покрыто `test_migration_columns_match_models`).
+
+Коммит: `feat(appointments): add slots and bookings tables`.
+
+### Task 2.3: репозиторий записей
+
+**Files:** Create `src/pa_booking/db/appointments.py`; Test `tests/integration/test_appointments_repo.py` (`db`).
+
+**Interfaces** (все — `session: Session` первым; коммит — у вызывающего):
+- `lock_slot(session, slot_id) -> SlotWithBooking | None` — `SELECT … FOR UPDATE` слота
+  + его активная бронь (`SlotWithBooking(slot: AppointmentSlot, booking:
+  AppointmentBooking | None)`), `state(...) -> SlotState` для домена;
+- `lock_employee(session, employee_id)` — `pg_advisory_xact_lock(hashtextextended(:id, 0))`;
+- `count_active_in_month(session, employee_id, year, month) -> int`;
+- `free_slots(session, date_from, date_to) -> list[AppointmentSlot]` — без удалённых и
+  без активной брони (фильтр «начало > now» — доменом в API);
+- `add_slots(session, slot_date, times, *, now) -> tuple[list[time], list[time]]`
+  (`added`, `duplicates`) — `INSERT … ON CONFLICT DO NOTHING` по частичному индексу
+  (`index_elements` + `index_where`), дубли = запрошенные минус вставленные;
+- `my_bookings(session, employee_id, statuses) -> list[BookingWithSlot]`;
+- `overview(session, date_from, date_to) -> list[SlotWithBooking]` — неудалённые слоты;
+- `remove_free_slots_on(session, day, *, now) -> list[time]` — с `FOR UPDATE`;
+- `export_rows(session, date_from | None, date_to | None) -> list[ExportRow]` — см. вопрос
+  в Task 2.6.
+
+Тесты (`db`): `count_active_in_month` считает прошедшие активные и не считает
+отменённые и брони других месяцев (граница: 31.10 и 01.11); `add_slots` возвращает
+`added`/`duplicates` и пропускает пару, совпадающую с неудалённым слотом, но не с
+удалённым; `free_slots` не отдаёт занятые и удалённые; `remove_free_slots_on` не
+трогает занятые слоты и слоты других дат.
+
+Коммит: `feat(appointments): add slots and bookings repository`.
+
+### Task 2.4: API записей
+
+**Files:** Create `src/pa_booking/api/appointments.py`, `src/pa_booking/api/appointments_schemas.py`;
+Modify `src/pa_booking/app.py` (подключить роутер); Test `tests/integration/test_api_appointments.py` (`db`)
+и общая фикстура `client` в `tests/integration/conftest.py` (как у `overtimes`: `create_app()`,
+override `get_settings` и `get_session`, `headers(user_id=…, roles=…)`).
+
+**Interfaces:** ручки §5.1 (кроме `export` — Task 2.6). `get_appointments_notifier()` —
+зависимость (`make_notifier(settings, "appointments")`), в тестах override на
+`FakeNotifier`. `DomainError` → `ApiError` по таблице кодов из «Решений блока».
+Уведомление — `background_tasks.add_task(notify_safely, …)` **после** `session.commit()`;
+ФИО — `names_by_id`, нет в снимке → `str(employee_id)`. Чужая бронь при отмене → 404.
+Ответы: слоты сгруппированы по дате `{"date": "2026-10-05", "slots": [{"id", "time"}]}`;
+запись → 201 `{id, slot_id, date, time, kind, status}`; добавление →
+`{"added": [...], "duplicates": [...]}`.
+
+Тесты (`db`), каждый с ожидаемым статусом и `code`:
+- без роли `psychologist` → 403 на всех `/admin/*`; `admin` в ролях не помогает;
+- запись на свободный будущий слот → 201 и одно уведомление `text_booked` с ФИО из снимка
+  (и с UUID, если в снимке нет); пятая активная запись в месяце → 409 `monthly_limit`;
+- гонка: два потока пишут один слот → один 201, второй 409 `slot_unavailable`
+  (`threading` + `Barrier`, две отдельные сессии);
+- отмена чужой брони → 404; своей до 14:00 → слот снова в `/slots`; сегодня после 14:00
+  → слот не возвращается (удалён); после начала → 409 `too_late_to_cancel`;
+- удаление занятого будущего слота → бронь `cancelled_by_specialist`, видна в
+  `/bookings/my` со статусом, уведомление `text_slot_removed`; занятого начавшегося →
+  409 `slot_in_past`; добавление на вчера → 422 `slot_date_in_past`;
+- уведомление не уходит, если транзакция упала (`FakeNotifier.sent == []` при 409);
+- сбой уведомления (`FakeNotifier(fail=True)`) → запись всё равно 201.
+
+«Сейчас» в тестах: `now` берётся через зависимость `get_now()` (по умолчанию
+`datetime.now(UTC)`), тесты подменяют её — без патчинга часов.
+
+Коммит: `feat(appointments): add appointments API`.
+
+### Task 2.5: чистка 14:00 МСК
+
+**Files:** Create `src/pa_booking/workers/appointments_cleanup.py`; Modify
+`src/pa_booking/workers/celery_app.py` (`TASK_MODULES`, `beat_schedule` —
+`crontab(hour=14, minute=0)` в зоне Celery = МСК); Test
+`tests/unit/test_cleanup_schedule.py`, `tests/integration/test_cleanup.py` (`db`).
+
+**Interfaces:** `run_cleanup(session, notifier, *, now) -> list[time]` (ядро без Celery:
+`cleanup_date(now)` → `remove_free_slots_on` → коммит → `notify_safely(text_cleanup)` если
+список не пуст); задача `pa_booking.appointments_cleanup`; догоняющий прогон —
+сигнал `worker_ready`: если `cleanup_date(now)` не None — `send_task` чистки.
+
+Тесты: расписание указывает на существующее имя задачи и на 14:00; `run_cleanup` до
+14:00 ничего не делает; после — удаляет только свободные сегодняшние, занятые и
+завтрашние остаются, одно уведомление; нечего удалять → уведомлений нет.
+
+Коммит: `feat(appointments): add daily 14:00 free slots cleanup`.
+
+### Task 2.6: xlsx-выгрузки
+
+**Files:** Create `src/pa_booking/export/__init__.py`, `src/pa_booking/export/xlsx.py`;
+Modify `pyproject.toml` (`"openpyxl>=3.1,<4"`), `src/pa_booking/api/appointments.py`;
+Test `tests/unit/test_xlsx.py`, дополнение `tests/integration/test_api_appointments.py`.
+
+**Interfaces:** `build_xlsx(title: str, headers: Sequence[str], rows: Iterable[Sequence[object]])
+-> bytes` (жирная шапка, ширина колонок по содержимому, даты как даты Excel);
+`GET /appointments/admin/export?month=YYYY-MM` или `?all=true` → `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`,
+`Content-Disposition: attachment; filename=appointments_2026-10.xlsx` / `appointments_all.xlsx`.
+Колонки §4.1: дата, время, ФИО, тип, статус. Ни `month`, ни `all` → 422.
+
+**Решено (пользователь, 2026-10-03): «как в боте»** — каждая бронь периода в любом
+статусе + каждый неудалённый слот без активной брони (ФИО/тип/статус пустые).
+Удалённые свободные слоты не выгружаются (бот их стирал). Пустой период — файл с одной
+шапкой (бот отвечал текстом «Нет записей»).
+
+Коммит: `feat(appointments): add xlsx export`.
+
+**Полный прогон блока (пользователь):** `TESTCONTAINERS_RYUK_DISABLED=true pytest -m "not external" -q`.
 
 ## Блок 3. Модуль библиотеки — скоуп
 
