@@ -12,7 +12,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 
 from pa_booking import __version__
-from pa_booking.api import appointments
+from pa_booking.api import appointments, library
 from pa_booking.core.config import get_settings
 from pa_booking.core.errors import install_error_handlers
 from pa_booking.core.http_metrics import install_http_metrics
@@ -53,6 +53,7 @@ def create_app() -> FastAPI:
     install_http_metrics(app)
     install_error_handlers(app)
     app.include_router(appointments.router)
+    app.include_router(library.router)
 
     @app.get("/health", tags=["ops"])
     def health() -> dict[str, str]:

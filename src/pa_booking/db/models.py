@@ -1,4 +1,4 @@
-"""ORM-модели: снимок директории и записи. Библиотека — в блоке 3."""
+"""ORM-модели: снимок директории, записи, библиотека."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     String,
+    Text,
     func,
     text,
 )
@@ -113,4 +114,54 @@ class AppointmentBooking(Base):
             postgresql_where=text("status = 'active'"),
         ),
         Index("ix_appointment_bookings_employee", "employee_id", "status"),
+    )
+
+
+class LibraryBook(Base):
+    """Книга каталога. Удаление мягкое — история выдач ссылается на книгу."""
+
+    __tablename__ = "library_books"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    genre: Mapped[str] = mapped_column(String(255), nullable=False)
+    author: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LibraryLoan(Base):
+    """Выдача книги — она же история (замена ``all_reserv_book`` бота)."""
+
+    __tablename__ = "library_loans"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    book_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("library_books.id"), nullable=False)
+    employee_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    starts_on: Mapped[date] = mapped_column(nullable=False)
+    due_on: Mapped[date] = mapped_column(nullable=False)
+    returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    returned_by_librarian: Mapped[bool] = mapped_column(
+        nullable=False, server_default=text("false")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Одна книга — одна невозвращённая выдача: защита от гонки двух броней.
+        Index(
+            "uq_library_loans_open",
+            "book_id",
+            unique=True,
+            postgresql_where=text("returned_at IS NULL"),
+        ),
+        Index(
+            "ix_library_loans_employee",
+            "employee_id",
+            postgresql_where=text("returned_at IS NULL"),
+        ),
     )

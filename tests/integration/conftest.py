@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from pa_booking.api.appointments import get_appointments_notifier
 from pa_booking.api.deps import get_now
+from pa_booking.api.library import get_library_notifier
 from pa_booking.app import create_app
 from pa_booking.core.config import Settings, get_settings
 from pa_booking.db.models import Base
@@ -87,6 +88,7 @@ def api(pg_engine: Engine, db_session: Session) -> ApiEnv:
     # Через env: тест может перевести часы или подменить notifier на падающий.
     app.dependency_overrides[get_now] = lambda: env.clock.now
     app.dependency_overrides[get_appointments_notifier] = lambda: env.notifier
+    app.dependency_overrides[get_library_notifier] = lambda: env.notifier
     return env
 
 

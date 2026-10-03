@@ -32,7 +32,7 @@ from pa_booking.api.deps import DbSession, Now, Principal, PsychologistPrincipal
 from pa_booking.core.config import Settings, get_settings
 from pa_booking.core.errors import ApiError
 from pa_booking.db import appointments as repo
-from pa_booking.db.directory import names_by_id
+from pa_booking.db.directory import display_names
 from pa_booking.db.models import AppointmentBooking, AppointmentSlot
 from pa_booking.domain.appointments import (
     KIND_TITLES,
@@ -80,8 +80,7 @@ def _by_date[T](items: Iterable[T], key: Callable[[T], date]) -> list[tuple[date
 
 
 def _name(session: Session, employee_id: uuid.UUID) -> str:
-    """ФИО из снимка ростера; нет в снимке — employee_id (спека §5.4)."""
-    return names_by_id(session, [employee_id]).get(employee_id, str(employee_id))
+    return display_names(session, [employee_id])[employee_id]
 
 
 def _booking_out(booking: AppointmentBooking, slot: AppointmentSlot) -> BookingOut:
@@ -221,7 +220,7 @@ def admin_overview(
 ) -> list[OverviewDayOut]:
     """Обзор месяца ± 3 дня: все неудалённые слоты, у занятых — ФИО и тип."""
     rows = repo.overview(session, *overview_range(*_parse_month(month)))
-    names = names_by_id(session, {r.booking.employee_id for r in rows if r.booking})
+    names = display_names(session, {r.booking.employee_id for r in rows if r.booking})
 
     def slot_out(r: repo.SlotWithBooking) -> OverviewSlotOut:
         b = r.booking
@@ -233,7 +232,7 @@ def admin_overview(
             else OverviewBookingOut(
                 id=b.id,
                 employee_id=b.employee_id,
-                full_name=names.get(b.employee_id, str(b.employee_id)),
+                full_name=names[b.employee_id],
                 kind=b.kind,
             ),
         )
@@ -304,7 +303,7 @@ def admin_export(
         rows = repo.export_rows(session, None, None)
         suffix, title = "all", "Все записи"
 
-    names = names_by_id(session, {r.employee_id for r in rows if r.employee_id})
+    names = display_names(session, {r.employee_id for r in rows if r.employee_id})
     data = build_xlsx(
         title,
         EXPORT_HEADERS,
@@ -312,7 +311,7 @@ def admin_export(
             (
                 r.slot_date,
                 r.slot_time,
-                None if r.employee_id is None else names.get(r.employee_id, str(r.employee_id)),
+                None if r.employee_id is None else names[r.employee_id],
                 None if r.kind is None else KIND_TITLES[r.kind],
                 None if r.status is None else STATUS_TITLES[r.status],
             )

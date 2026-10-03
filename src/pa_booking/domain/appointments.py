@@ -12,11 +12,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import StrEnum
-from zoneinfo import ZoneInfo
 
 from pa_booking.domain.errors import DomainError
 
-MSK = ZoneInfo("Europe/Moscow")
+# «as MSK» — явный реэкспорт: модуль записей и его тесты берут MSK отсюда.
+from pa_booking.domain.moscow import MSK as MSK
+
 # С 14:00 МСК свободные слоты на сегодня удаляются, а отмена записи на сегодня
 # удаляет слот, а не освобождает его (как в боте: schedule_utils.py:33-40).
 LOCK_TIME = time(14, 0)

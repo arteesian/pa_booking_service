@@ -55,3 +55,10 @@ def snapshot_age_seconds(session: Session, *, now: datetime) -> float | None:
     if state is None:
         return None
     return (now - state.synced_at).total_seconds()
+
+
+def display_names(session: Session, ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Имя для уведомлений и выгрузок: ФИО из снимка, нет в снимке — employee_id (§5.4)."""
+    wanted = set(ids)
+    names = names_by_id(session, wanted)
+    return {i: names.get(i, str(i)) for i in wanted}

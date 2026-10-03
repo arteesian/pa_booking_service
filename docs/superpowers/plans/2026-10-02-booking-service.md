@@ -2313,9 +2313,135 @@ Test `tests/unit/test_xlsx.py`, дополнение `tests/integration/test_api
 
 **Полный прогон блока (пользователь):** `TESTCONTAINERS_RYUK_DISABLED=true pytest -m "not external" -q`.
 
-## Блок 3. Модуль библиотеки — скоуп
+## Блок 3. Модуль библиотеки
 
-Домен §4.2, таблицы, API §5.2, уведомления, xlsx истории.
+**Итог:** библиотека работает через API §5.2: жанры, каталог с признаком «свободна»,
+бронь на 7 дней, продление, возврат (пользователем и библиотекарем), управление
+каталогом, списки выдач, уведомления §5.5, xlsx истории.
+
+**Как расписан блок.** Короче блока 2: сигнатуры, решения и тест-кейсы; код — по ходу
+реализации. Механика (блокировки, `DomainError` → HTTP, уведомление после коммита,
+фикстура `api`) — та же, что в блоке 2.
+
+**Сверено с ботом** (`projects/Library_bot`): срок — сегодня + 7 (`call.py:246-247`);
+продление — от текущего срока, `end + 7`, без лимита (`database.py:extend_booking`);
+бот прятал просроченные из «Моих броней» (`end >= CURDATE()`), поэтому продлить
+просроченную было нельзя — у нас то же явно: 409 `loan_overdue` (Д-3 касается только
+видимости и возврата); жанры — `DISTINCT genre` по книгам; каталог жанра — сначала
+свободные, потом по названию; напоминаний о просрочке в боте нет — периодических
+задач у библиотеки нет. Тексты уведомлений — `call.py:261-265, 345-349, 422-425`.
+
+**Решения блока:**
+- Гонки: бронь — частичный уникальный индекс `(book_id) WHERE returned_at IS NULL`
+  + `FOR UPDATE` на строку книги (бронь и мягкое удаление книги не проскакивают друг
+  мимо друга); продление и возврат — `FOR UPDATE` на строку выдачи.
+- Коды: 409 `book_unavailable` (книга на руках), `loan_overdue` (продление
+  просроченной), `book_on_loan` (удаление книги на руках); удалённая книга, чужая или
+  уже возвращённая выдача → 404.
+- «Сегодня» — дата МСК от `now`. Просрочка: `due_on < сегодня` (в день срока — ещё нет).
+- Даты в уведомлениях — `dd.mm.yyyy` везде (бот в продлении печатал ISO `2026-10-12` —
+  случайность форматирования, не правило).
+- Модули не импортируют друг друга: общий хелпер «ФИО или employee_id» переезжает из
+  `api/appointments.py` в `db/directory.py` (`display_names`).
+- Уточнения при реализации: `MSK` и «сегодня по Москве» вынесены в общий
+  `domain/moscow.py` (`appointments.MSK` остался реэкспортом); ответы выдач содержат
+  `returned_at`; `PATCH` с `null` в поле — поле не меняется.
+- Каталог добавляется по одной книге (`POST /library/admin/books`); пачку, как в боте
+  через `/done`, собирает SPA.
+
+### Task 3.1: домен библиотеки
+
+**Files:** Create `src/pa_booking/domain/library.py`; Test `tests/unit/test_domain_library.py`.
+
+**Interfaces:** `LOAN_DAYS = 7`; `today_msk(now) -> date`; `new_loan_dates(*, now) ->
+tuple[date, date]`; `ensure_loanable(*, on_loan: bool)`; `extended_due(due_on, *, now) ->
+date`; `is_overdue(due_on, *, now) -> bool`; `ensure_removable(*, on_loan: bool)`;
+тексты `text_loaned(name, title, due_on)`, `text_extended(name, title, due_on)`,
+`text_returned(name, title, *, by_librarian: bool)`.
+
+Тесты: 23:30 UTC 4-го = 02:30 МСК 5-го → выдача 05.10–12.10; книга на руках →
+`book_unavailable`; продление в день срока → +7 от срока (не от сегодня), на следующий
+день → `loan_overdue`; `is_overdue` граница (в день срока — нет); удаление книги на
+руках → `book_on_loan`; тексты:
+`Иванов Иван забронировал книгу Мастер и Маргарита ⏳\nДата возврата: 12.10.2026`,
+`Иванов Иван продлил бронирование: Мастер и Маргарита ✅\nНовая дата возврата: 19.10.2026`,
+`Иванов Иван вернул книгу Мастер и Маргарита ✅` и с `by_librarian` —
+`… ✅ (отметил библиотекарь)`.
+
+Коммит — общий на блок (см. CLAUDE.md).
+
+### Task 3.2: таблицы и миграция
+
+**Files:** Modify `src/pa_booking/db/models.py`; Create `alembic/versions/0003_library.py`;
+Test `tests/integration/test_library_schema.py` (`db`).
+
+**Interfaces:** `LibraryBook(id, genre, author, title, description, created_at,
+removed_at)`, `LibraryLoan(id, book_id, employee_id, starts_on, due_on, returned_at,
+returned_by_librarian, created_at)` — ровно §4.2. Индексы:
+`uq_library_loans_open (book_id) WHERE returned_at IS NULL`,
+`ix_library_loans_employee (employee_id) WHERE returned_at IS NULL`.
+
+Тесты: вторая невозвращённая выдача книги → `IntegrityError`, после `returned_at` у
+первой — можно.
+
+### Task 3.3: репозиторий
+
+**Files:** Create `src/pa_booking/db/library.py`; Test `tests/integration/test_library_repo.py` (`db`).
+
+**Interfaces** (`session` первым, коммит у вызывающего):
+`genres(session) -> list[str]` (неудалённые книги, по алфавиту);
+`catalog(session, genre: str | None) -> list[BookWithLoan]` (свободные первыми, потом
+по названию); `lock_book(session, book_id) -> BookWithLoan | None` (`FOR UPDATE`,
+`populate_existing`); `lock_loan(session, loan_id) -> LoanWithBook | None` (то же);
+`my_loans(session, employee_id) -> list[LoanWithBook]` (невозвращённые, по сроку);
+`open_loans(session, *, overdue: bool, today: date) -> list[LoanWithBook]`;
+`history(session) -> list[LoanWithBook]` (как бот: `returned_at DESC NULLS LAST,
+due_on DESC`).
+
+Тесты: `genres` без удалённых книг и без дублей; `catalog` — порядок и признак
+«свободна»; `open_loans` — граница `due_on == today` в `active`; `history` — порядок;
+`lock_loan` перечитывает строку, изменённую другой сессией.
+
+### Task 3.4: API библиотеки
+
+**Files:** Create `src/pa_booking/api/library.py`, `src/pa_booking/api/library_schemas.py`;
+Modify `src/pa_booking/app.py`, `src/pa_booking/db/directory.py` (`display_names`),
+`src/pa_booking/api/appointments.py` (на `display_names`), `tests/integration/conftest.py`
+(override `get_library_notifier`); Test `tests/integration/test_api_library.py` (`db`).
+
+**Interfaces:** ручки §5.2; ответы — `BookOut {id, genre, author, title, description,
+available}`, `LoanOut {id, book: BookOut, starts_on, due_on, overdue}`, админский
+`AdminLoanOut` = `LoanOut` + `employee_id`, `full_name`. Бронь → 201; удаление книги →
+204; `PATCH` — частичный (`author/title/description/genre`, непустые строки ≤ 255).
+
+Тесты (каждый со статусом и `code`):
+- без роли `librarian` → 403 на всех `/library/admin/*`, `admin`/`psychologist` не помогают;
+- бронь свободной → 201, `due_on` = +7, уведомление `text_loaned` с ФИО; занятой → 409
+  `book_unavailable`, уведомления нет; удалённой → 404;
+- гонка двух броней одной книги → 201 + 409;
+- продление своей → `due_on` +7 и уведомление; просроченной → 409 `loan_overdue`;
+  чужой → 404;
+- возврат своей просроченной → 200 (Д-3), книга снова свободна; чужой → 404; повторный → 404;
+- возврат библиотекарем → `returned_by_librarian`, текст с пометкой;
+- «Мои выдачи» показывают просроченную с `overdue: true`;
+- `admin/loans?state=active|overdue` разносит по сроку, с ФИО;
+- удаление книги на руках → 409 `book_on_loan`; свободной → 204, пропала из каталога
+  и жанров; `PATCH` удалённой → 404;
+- сбой уведомления → операция всё равно успешна.
+
+### Task 3.5: xlsx истории
+
+**Files:** Modify `src/pa_booking/api/library.py`; дополнение `tests/integration/test_api_library.py`.
+
+**Interfaces:** `GET /library/admin/export` → xlsx `library_history.xlsx`, лист
+«История выдач», колонки §4.2: Книга, ФИО, Начало, Срок, Дата возврата (дата МСК),
+Кто отметил (`Пользователь` / `Библиотекарь` / пусто, если на руках). Строки —
+`history()`.
+
+Тесты: строки и порядок как у бота; невозвращённая — пустые «Дата возврата» и
+«Кто отметил»; без роли → 403.
+
+**Прогон блока (пользователь):** `TESTCONTAINERS_RYUK_DISABLED=true .venv/bin/pytest -m db -q`.
 
 ## Блок 4. BFF + SPA — скоуп
 
