@@ -53,10 +53,13 @@ python -m pytest -m external -q
 ```bash
 pip install -e ".[migrate]"
 set -a; . ./.env; set +a
-python scripts/import_from_bots.py slots          # dry-run: план и цифры
-python scripts/import_from_bots.py slots --assign <HUID>=<employee_id>:<psy|mkr> --apply
+python scripts/import_from_bots.py slots          # dry-run: план, у броней — кто и откуда
+python scripts/import_from_bots.py slots --apply  # [--kind <HUID>=<psy|mkr>] [--assign <HUID>=<employee_id>:<psy|mkr>]
 python scripts/import_from_bots.py books          # dry-run
 python scripts/import_from_bots.py books --apply
 ```
 
+Сотрудник брони — по HUID из снимка ростера (учётка `express` в auth, синк каждые
+15 минут), тип — из однозначного комментария бота («психолог» / «мкр») или `--kind`;
+`--assign` — ручное переопределение. Несопоставленную бронь скрипт не пишет.
 Слоты можно переносить повторно (дубли пропускаются); каталог — однократно.

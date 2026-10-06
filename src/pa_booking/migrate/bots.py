@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 
@@ -56,6 +56,8 @@ class BookedSlot:
     tg_id: int | None
     comment: str | None
     assignment: Assignment | None
+    # Откуда сотрудник и тип (или почему не сопоставлено) — для печати плана.
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -103,16 +105,70 @@ def parse_assign(value: str) -> Assignment:
         raise ValueError(f"--assign {value!r}: ожидается <HUID>=<employee_id>:<psy|mkr>") from exc
 
 
+def parse_kind(value: str) -> tuple[str, Kind]:
+    """``<HUID>=<psy|mkr>`` → (HUID, тип)."""
+    try:
+        huid, kind = value.split("=", 1)
+        return huid.strip(), Kind(kind.strip())
+    except ValueError as exc:
+        raise ValueError(f"--kind {value!r}: ожидается <HUID>=<psy|mkr>") from exc
+
+
+def kind_from_comment(comment: str | None) -> Kind | None:
+    """Тип брони из свободного ответа бота — только если он однозначен.
+
+    Бот спрашивал «психолог или МКР?» и сохранял ответ как есть (Д-1). Берём тип,
+    только если в ответе ровно одно из «псих» / «мкр»; иначе — None, решает человек.
+    """
+    text = (comment or "").lower()
+    psy, mkr = "псих" in text, "мкр" in text
+    if psy == mkr:
+        return None
+    return Kind.PSY if psy else Kind.MKR
+
+
+def _resolve(
+    row: SlotRow,
+    *,
+    explicit: Mapping[str, Assignment],
+    huid_to_employee: Mapping[str, uuid.UUID],
+    kinds: Mapping[str, Kind],
+) -> tuple[Assignment | None, str]:
+    """Сотрудник и тип брони: ``--assign`` → ростер (+ ``--kind`` / комментарий)."""
+    if row.huid is None:
+        return None, "бронь без HUID (Telegram) — перенести можно только руками в ЛК"
+    if row.huid in explicit:
+        return explicit[row.huid], "--assign"
+    employee_id = huid_to_employee.get(row.huid)
+    if employee_id is None:
+        return None, "HUID нет в ростере — нужен --assign"
+    if row.huid in kinds:
+        return Assignment(row.huid, employee_id, kinds[row.huid]), "ростер, тип из --kind"
+    kind = kind_from_comment(row.comment)
+    if kind is None:
+        return None, "тип не понятен из комментария — нужен --kind"
+    return Assignment(row.huid, employee_id, kind), "ростер, тип из комментария"
+
+
 def plan_slots(
-    rows: Iterable[SlotRow], *, today: date, assignments: Sequence[Assignment]
+    rows: Iterable[SlotRow],
+    *,
+    today: date,
+    assignments: Sequence[Assignment],
+    huid_to_employee: Mapping[str, uuid.UUID] | None = None,
+    kinds: Mapping[str, Kind] | None = None,
 ) -> SlotPlan:
     """Будущие (с ``today`` включительно) слоты: свободные и занятые.
 
     Занятым считается слот с HUID **или** ``tg_id`` (бронь времён Telegram) — как в
-    боте. Сопоставление — по HUID; ``--assign`` на HUID без будущей брони — ошибка:
+    боте. Сотрудник брони — из ``--assign``, иначе по HUID из снимка ростера (учётка
+    ``express`` в auth); тип — из ``--assign`` / ``--kind`` / однозначного
+    комментария. ``--assign`` / ``--kind`` на HUID без будущей брони — ошибка:
     опечатка не должна молча оставить бронь без переноса.
     """
     by_huid = {a.huid: a for a in assignments}
+    snapshot = huid_to_employee or {}
+    explicit_kinds = kinds or {}
     free: list[tuple[date, time]] = []
     booked: list[BookedSlot] = []
     for number, row in enumerate(rows, start=1):
@@ -125,14 +181,17 @@ def plan_slots(
         if row.huid is None and row.tg_id is None:
             free.append((slot_date, slot_time))
             continue
-        assignment = by_huid.get(row.huid) if row.huid is not None else None
-        booked.append(
-            BookedSlot(slot_date, slot_time, row.huid, row.tg_id, row.comment, assignment)
+        assignment, source = _resolve(
+            row, explicit=by_huid, huid_to_employee=snapshot, kinds=explicit_kinds
         )
-    used = {b.assignment.huid for b in booked if b.assignment is not None}
-    unknown = sorted(set(by_huid) - used)
-    if unknown:
-        raise ValueError(f"--assign: HUID не найден среди будущих броней: {', '.join(unknown)}")
+        booked.append(
+            BookedSlot(slot_date, slot_time, row.huid, row.tg_id, row.comment, assignment, source)
+        )
+    future_huids = {b.huid for b in booked if b.huid is not None}
+    for flag, given in (("--assign", set(by_huid)), ("--kind", set(explicit_kinds))):
+        unknown = sorted(given - future_huids)
+        if unknown:
+            raise ValueError(f"{flag}: HUID не найден среди будущих броней: {', '.join(unknown)}")
     return SlotPlan(
         tuple(sorted(free)), tuple(sorted(booked, key=lambda b: (b.slot_date, b.slot_time)))
     )

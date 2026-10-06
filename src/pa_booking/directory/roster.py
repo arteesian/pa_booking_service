@@ -36,6 +36,9 @@ class RosterPerson(BaseModel):
     employee_id: uuid.UUID
     name: str
     dismissed: bool
+    # {service: external_id} привязок auth; нам нужен ``express`` (HUID eXpress) —
+    # по нему переносятся брони ботов. Дефолт пустой: старый auth поля не отдаёт.
+    service_accounts: dict[str, str] = {}
 
 
 class RosterSnapshot(BaseModel):

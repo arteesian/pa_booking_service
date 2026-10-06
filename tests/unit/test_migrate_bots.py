@@ -92,3 +92,89 @@ def test_clean_book_strips_and_rejects_empty() -> None:
     )
     with pytest.raises(ValueError):
         clean_book(BookRow("Роман", "  ", "Мастер", "—"))
+
+
+# --- автосопоставление по HUID из снимка ростера и тип из комментария ---------
+
+from pa_booking.migrate.bots import kind_from_comment  # noqa: E402
+
+
+def booked(comment: str | None, huid: str = HUID) -> SlotRow:
+    return SlotRow("07.10.2026", "11:00", huid, None, comment)
+
+
+@pytest.mark.parametrize(
+    ("comment", "kind"),
+    [
+        ("Психолог", Kind.PSY),
+        ("к психологу, пожалуйста", Kind.PSY),
+        ("МКР", Kind.MKR),
+        ("консультация мкр", Kind.MKR),
+        ("психолог или мкр?", None),
+        ("к Анне", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_kind_from_comment_only_when_unambiguous(comment: str | None, kind: Kind | None) -> None:
+    assert kind_from_comment(comment) is kind
+
+
+def test_booking_resolved_by_snapshot_and_comment() -> None:
+    plan = plan_slots([booked("МКР")], today=TODAY, assignments=[], huid_to_employee={HUID: EMP})
+    (b,) = plan.booked
+    assert b.assignment == Assignment(HUID, EMP, Kind.MKR)
+    assert b.source == "ростер, тип из комментария"
+
+
+def test_explicit_kind_overrides_comment() -> None:
+    plan = plan_slots(
+        [booked("к Анне")],
+        today=TODAY,
+        assignments=[],
+        huid_to_employee={HUID: EMP},
+        kinds={HUID: Kind.PSY},
+    )
+    assert plan.booked[0].assignment == Assignment(HUID, EMP, Kind.PSY)
+    assert plan.booked[0].source == "ростер, тип из --kind"
+
+
+def test_assign_overrides_snapshot() -> None:
+    other = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    plan = plan_slots(
+        [booked("МКР")],
+        today=TODAY,
+        assignments=[Assignment(HUID, other, Kind.PSY)],
+        huid_to_employee={HUID: EMP},
+    )
+    assert plan.booked[0].assignment == Assignment(HUID, other, Kind.PSY)
+    assert plan.booked[0].source == "--assign"
+
+
+@pytest.mark.parametrize(
+    ("comment", "snapshot", "reason"),
+    [
+        ("МКР", {}, "HUID нет в ростере"),
+        ("к Анне", {HUID: EMP}, "тип не понятен из комментария"),
+    ],
+)
+def test_unresolved_booking_explains_why(
+    comment: str, snapshot: dict[str, uuid.UUID], reason: str
+) -> None:
+    plan = plan_slots([booked(comment)], today=TODAY, assignments=[], huid_to_employee=snapshot)
+    (b,) = plan.unassigned
+    assert b.assignment is None
+    assert reason in b.source
+
+
+def test_kind_for_unknown_huid_is_an_error() -> None:
+    with pytest.raises(ValueError, match="--kind"):
+        plan_slots([booked("МКР")], today=TODAY, assignments=[], kinds={"нет-такого": Kind.PSY})
+
+
+def test_parse_kind() -> None:
+    from pa_booking.migrate.bots import parse_kind
+
+    assert parse_kind(f"{HUID}=mkr") == (HUID, Kind.MKR)
+    with pytest.raises(ValueError):
+        parse_kind(f"{HUID}=other")

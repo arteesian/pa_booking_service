@@ -39,6 +39,8 @@ class DirectoryEmployee(Base):
     employee_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     full_name: Mapped[str] = mapped_column(String(256), nullable=False)
     dismissed: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    # HUID eXpress (учётка ``express`` в auth) — по нему переносятся брони ботов.
+    express_huid: Mapped[str | None] = mapped_column(String(64), index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

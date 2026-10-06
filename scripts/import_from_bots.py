@@ -1,10 +1,12 @@
 """Разовый перенос из MySQL ботов в pa_booking_service (спека §7, план — блок 5).
 
     pip install -e ".[migrate]"
-    python scripts/import_from_bots.py slots [--assign <HUID>=<employee_id>:<psy|mkr>] [--apply]
+    python scripts/import_from_bots.py slots [--kind <HUID>=<psy|mkr>] [--assign …] [--apply]
     python scripts/import_from_bots.py books [--apply]
 
 Без ``--apply`` — dry-run: только план и цифры. Источник читается только SELECT'ами.
+Сотрудник брони — по HUID из снимка ростера (учётка ``express`` в auth), тип — из
+однозначного комментария бота или ``--kind``; ``--assign`` — ручное переопределение.
 Подключения — из окружения (``.env``):
 
 - ``PA_BOOKING_MIGRATE_PSY_MYSQL_URL`` / ``PA_BOOKING_MIGRATE_LIBRARY_MYSQL_URL`` —
@@ -23,6 +25,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from pa_booking.core.config import get_settings
+from pa_booking.db.directory import employees_by_huid
 from pa_booking.db.session import make_engine_from_settings
 from pa_booking.domain.moscow import today_msk
 from pa_booking.migrate.bots import (
@@ -31,6 +34,7 @@ from pa_booking.migrate.bots import (
     apply_books,
     apply_slots,
     parse_assign,
+    parse_kind,
     plan_slots,
 )
 
@@ -68,18 +72,26 @@ def _slots(args: argparse.Namespace, now: datetime) -> None:
             "SELECT date, time, user_huid, tg_id, comment FROM record_psy_pari ORDER BY id",
         )
     ]
+    engine = make_engine_from_settings(get_settings())
+    with Session(engine) as session:
+        huid_map = employees_by_huid(session)
     plan = plan_slots(
-        rows, today=today_msk(now), assignments=[parse_assign(a) for a in args.assign]
+        rows,
+        today=today_msk(now),
+        assignments=[parse_assign(a) for a in args.assign],
+        huid_to_employee=huid_map,
+        kinds=dict(parse_kind(k) for k in args.kind),
     )
     print(f"Строк в record_psy_pari: {len(rows)}")
     print(f"Будущих свободных слотов: {len(plan.free)}")
-    print(f"Будущих занятых слотов: {len(plan.booked)}")
+    print(f"Будущих занятых слотов: {len(plan.booked)} (HUID в ростере: {len(huid_map)})")
     for b in plan.booked:
         who = (
             f"→ {b.assignment.employee_id} ({b.assignment.kind})"
             if b.assignment
             else "→ НЕ СОПОСТАВЛЕН"
         )
+        who = f"{who} [{b.source}]"
         print(
             f"  {b.slot_date:%d.%m.%Y} {b.slot_time:%H:%M} huid={b.huid} tg_id={b.tg_id}"
             f" комментарий={b.comment!r} {who}"
@@ -87,7 +99,7 @@ def _slots(args: argparse.Namespace, now: datetime) -> None:
     if not args.apply:
         print("Dry-run: ничего не записано. Для записи — --apply.")
         return
-    with Session(make_engine_from_settings(get_settings())) as session:
+    with Session(engine) as session:
         result = apply_slots(session, plan, now=now)
         session.commit()
     print(f"Записано: слотов {result.added}, уже были {result.skipped}, броней {result.bookings}.")
@@ -119,6 +131,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="what", required=True)
     slots = sub.add_parser("slots", help="будущие слоты записей (+ сопоставленные брони)")
     slots.add_argument("--assign", action="append", default=[], metavar="HUID=EMPLOYEE_ID:KIND")
+    slots.add_argument("--kind", action="append", default=[], metavar="HUID=KIND")
     slots.add_argument("--apply", action="store_true")
     books = sub.add_parser("books", help="каталог книг")
     books.add_argument("--apply", action="store_true")

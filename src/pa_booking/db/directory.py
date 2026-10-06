@@ -23,7 +23,10 @@ def save_snapshot(session: Session, rows: Sequence[EmployeeRow], *, now: datetim
     session.add_all(
         [
             DirectoryEmployee(
-                employee_id=r.employee_id, full_name=r.full_name, dismissed=r.dismissed
+                employee_id=r.employee_id,
+                full_name=r.full_name,
+                dismissed=r.dismissed,
+                express_huid=r.express_huid,
             )
             for r in rows
         ]
@@ -62,3 +65,13 @@ def display_names(session: Session, ids: Iterable[uuid.UUID]) -> dict[uuid.UUID,
     wanted = set(ids)
     names = names_by_id(session, wanted)
     return {i: names.get(i, str(i)) for i in wanted}
+
+
+def employees_by_huid(session: Session) -> dict[str, uuid.UUID]:
+    """HUID eXpress → employee_id по снимку (у кого учётка ``express`` привязана)."""
+    rows = session.execute(
+        select(DirectoryEmployee.express_huid, DirectoryEmployee.employee_id).where(
+            DirectoryEmployee.express_huid.is_not(None)
+        )
+    ).all()
+    return {huid: employee_id for huid, employee_id in rows if huid}
