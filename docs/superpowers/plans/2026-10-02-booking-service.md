@@ -2531,7 +2531,62 @@ auth через админку; `VITE_LIBRARY_ORDER_BOOK_URL` = `ORDER_BOOK_LINK
 **Прогоны (пользователь, в `pa_bff`):** `pytest tests/api/test_booking.py -q`, затем
 `cd frontend && npx vitest run && npm run build`.
 
-## Блок 5. Скрипты переноса — скоуп
+## Блок 5. Скрипты переноса
 
-§7: каталог и будущие свободные слоты автоматически; CSV для ручного сопоставления
-HUID → `employee_id`; ассерты из посчитанных `SELECT COUNT(*)`.
+**Итог:** разовый перенос из MySQL ботов: будущие слоты записей (с единственной
+будущей бронью) и каталог книг. История не переносится (§7).
+
+**Факты из прода** (запросы пользователя 2026-10-06, ассерты dry-run — из них):
+- `record_psy_pari`: 137 строк, кривых дат/времени 0; будущих свободных **15**,
+  будущих занятых **1** (с HUID, без `tg_id`).
+- `Library_books`: **106** книг, 11 жанров, пустых полей 0, длины ≤ 91 (у нас 255);
+  4 «на руках» — все просрочены, 3 из них только с `tg_id` (Telegram). По словам
+  библиотекаря книги возвращены → **все книги переносим свободными**.
+- В `pa_auth_service` HUID eXpress не хранится — бронь сопоставляется вручную.
+- Базы `MKR`/`MKR_pari` — отдельное приложение `eliseev/mkr-220926`, psy_bot_v2 их не
+  использует → не переносим (решение пользователя).
+
+**Решения:**
+- Без CSV-шага §7: бронь одна → аргумент `--assign <HUID>=<employee_id>:<psy|mkr>`.
+  Без него занятый слот не переносится: `--apply` отказывается и печатает бронь
+  (дата, время, HUID, комментарий) — человека находим по уведомлению в чате.
+- Параллельная работа (пользователь, 2026-10-06): ЛК запускается при живых ботах,
+  боты гасятся позже; расхождения пользователь дублирует руками. Поэтому перенос
+  слотов идемпотентен (`add_slots` — дубли пропускаются), каталог — однократный:
+  при непустом `library_books` скрипт отказывается.
+- По умолчанию — dry-run (только план и цифры); запись — флагом `--apply`, одной
+  транзакцией на команду.
+- Источник читаем `pymysql` через SQLAlchemy (`mysql+pymysql://`), DSN —
+  `PA_BOOKING_MIGRATE_PSY_MYSQL_URL` / `PA_BOOKING_MIGRATE_LIBRARY_MYSQL_URL` в `.env`
+  (только чтение; не в `Settings` — сервису они не нужны). Зависимость — в extra
+  `[migrate]`, в прод-образ не попадает.
+- Запуск — с машины пользователя или прод-хоста: нужны доступ к MySQL ботов и к
+  Postgres сервиса (`PA_BOOKING_DATABASE_URL`).
+
+### Task 5.1: перенос
+
+**Files:** Create `src/pa_booking/migrate/__init__.py`, `src/pa_booking/migrate/bots.py`
+(чистые функции), `scripts/import_from_bots.py` (CLI); Modify `pyproject.toml`
+(`[project.optional-dependencies] migrate = ["pymysql>=1.1,<2"]`), `README.md`;
+Test `tests/unit/test_migrate_bots.py`, `tests/integration/test_migrate_apply.py` (`db`).
+
+**Interfaces:** `parse_slot(date_str, time_str) -> tuple[date, time]` (`DD.MM.YYYY`,
+`HH:MM`, иначе `ValueError`); `SlotRow(date_str, time_str, huid, tg_id, comment)`;
+`plan_slots(rows, *, today, assign) -> SlotPlan(free, booked, unassigned)` (только
+`date >= today`); `parse_assign("HUID=uuid:kind") -> (huid, employee_id, Kind)`;
+`BookRow(genre, author, title, description)` → обрезка пробелов, пустое поле —
+`ValueError`; `apply_slots(session, plan, *, now)` (слоты через `add_slots`, бронь —
+`active`, как запись пользователя); `apply_books(session, rows, *, now)` (отказ при
+непустом каталоге).
+
+CLI: `python scripts/import_from_bots.py slots [--assign …] [--apply]`,
+`python scripts/import_from_bots.py books [--apply]`.
+
+Тесты: разбор дат/времени (вкл. кривые → ошибка с номером строки); прошлые слоты
+не попадают; занятый без `--assign` → в `unassigned`, `--apply` отказывается;
+`tg_id` без HUID — занятым; `--assign` с неизвестным HUID → ошибка; (`db`) повторный
+`apply_slots` ничего не дублирует; `apply_books` на непустом каталоге → отказ.
+
+**Проверка на проде (пользователь):** dry-run обеих команд → цифры совпадают с
+фактами выше (15 + 1, 106) → `--apply`.
+

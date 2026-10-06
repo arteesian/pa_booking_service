@@ -28,6 +28,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Только для scripts/import_from_bots.py (разовый перенос из MySQL ботов).
+migrate = ["pymysql>=1.1,<2"]
 dev = [
     "pytest>=8.0,<10",
     "ruff>=0.4,<1",

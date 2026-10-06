@@ -42,3 +42,21 @@ python -m pytest -m external -q
 
 Схема и порядок — в шапке `docker/docker-compose.yml`. API наружу не публикуется:
 его вызывает только BFF по сети `pa_net` (`booking-api:8000`).
+
+## Перенос из ботов (разово)
+
+Будущие слоты `psy_bot_v2` и каталог `Library_bot` (спека §7, план — блок 5).
+Запуск — откуда есть доступ к MySQL ботов и к Postgres сервиса. В `.env` добавить
+`PA_BOOKING_MIGRATE_PSY_MYSQL_URL` и `PA_BOOKING_MIGRATE_LIBRARY_MYSQL_URL`
+(`mysql+pymysql://user:pass@host:3306/db`, пользователь только на чтение).
+
+```bash
+pip install -e ".[migrate]"
+set -a; . ./.env; set +a
+python scripts/import_from_bots.py slots          # dry-run: план и цифры
+python scripts/import_from_bots.py slots --assign <HUID>=<employee_id>:<psy|mkr> --apply
+python scripts/import_from_bots.py books          # dry-run
+python scripts/import_from_bots.py books --apply
+```
+
+Слоты можно переносить повторно (дубли пропускаются); каталог — однократно.
