@@ -53,14 +53,10 @@ pytest, ruff, mypy --strict.
 
 ## Открытые вопросы
 
-- **BotX `/direct/sync` отвечает `HTTP 204` без тела** (external-тест 2026-10-03,
-  13:44 и 13:52 МСК, оба модуля). `BotxNotifier` ждёт JSON `{"status": "ok"}` (контракт
-  из pybotx) и считает 204 ошибкой → `tests/external/test_botx.py` красный. Решает факт:
-  дошли ли сообщения `[ТЕСТ ЛК, external-тест…]` в служебные чаты.
-  Дошли → 204 = успех (как в `express_notif`: только `raise_for_status`), правим `send`
-  + юнит-тест; минус — ошибки доставки при 204 не видны. Не дошли → 204 отдаёт не BotX
-  (прокси/балансировщик), разбираемся с маршрутом `PA_BOOKING_BOTX_CTS_URL`.
-  До решения `spikes/` не удаляем.
+- ~~BotX `/direct/sync` отвечает `HTTP 204` без тела~~ — **закрыт 2026-10-06.** Причина —
+  непарная кавычка в `.env`: значения читались битыми. После исправления пробник
+  pybotx (`chats`, `nowait`, `sync`) и `tests/external/test_botx.py` прошли, сообщения
+  дошли в оба чата. `BotxNotifier` не меняли; `spikes/` удалён.
 
 ---
 
@@ -2443,10 +2439,97 @@ available}`, `LoanOut {id, book: BookOut, starts_on, due_on, overdue}`, адми
 
 **Прогон блока (пользователь):** `TESTCONTAINERS_RYUK_DISABLED=true .venv/bin/pytest -m db -q`.
 
-## Блок 4. BFF + SPA — скоуп
+## Блок 4. BFF + SPA
 
-§6: `pa_bff/clients/booking.py`, проксирующие роутеры, потоковый xlsx; страницы SPA,
-гейты по ролям, ошибки по `code`. Роли `psychologist`/`librarian` в `pa_auth_service`.
+**Итог:** в ЛК появляются разделы «Записи» и «Библиотека»: BFF проксирует
+`/api/appointments/*` и `/api/library/*` в `booking-api`, SPA рисует страницы.
+Работа — в репозитории `pa_bff` (backend + `frontend/`); правила там — его
+`CLAUDE.md` (pytest, `npm run build` и `vitest` запускает пользователь; ruff, mypy,
+eslint, `tsc --noEmit` — исполнитель).
+
+**Найдено при разведке (меняет план §6 спеки):**
+- BFF разбирает роли токена в свой `Role` и **молча отбрасывает незнакомые**
+  (`core/auth.py:_parse_roles`), а `X-User-Roles` вниз собирает из уже разобранных.
+  Без `psychologist`/`librarian` в `Role` BFF они до сервиса не дойдут — все админские
+  ручки ответят 403. `has_role` в BFF даёт `admin` любую роль, но гейтов в BFF у нас
+  нет (права проверяет сервис, как у `overtimes`), так что это не протекает.
+- `pa_auth_service` код не меняем: справочник ролей расширяемый (`roles` +
+  `employee_roles`, API `/v1/roles`), в токен уходят любые коды. Роли заводятся и
+  назначаются через существующий админский API/UI — шаг выкатки, не код.
+- `RoleGate` в SPA пускает `admin` всегда — для вкладок специалиста/библиотекаря
+  нужен свой точный гейт (CLAUDE.md сервиса: `admin` роли не покрывает).
+- Наш сервис уже отдаёт `detail` по-русски — карта русификации, как у `overtimes`,
+  не нужна; `errors.ts` покажет кириллический `detail` как есть.
+- xlsx: BFF у `kpd` проксирует файлы буфером (`mesh.download`), не потоком; выгрузки
+  у нас — десятки КБ. Делаем так же, буфером; «потоком» из §6 — не нужно.
+
+### Task 4.1: BFF — роли, клиент, роутеры
+
+**Files (pa_bff):** Modify `src/pa_bff/core/auth.py` (`Role.PSYCHOLOGIST`,
+`Role.LIBRARIAN`), `src/pa_bff/core/config.py` (`booking_base_url`,
+`booking_api_key: SecretStr`), `src/pa_bff/app.py`, `.env.example`,
+`docker/docker-compose.yml` (если там перечислены env апстримов); Create
+`src/pa_bff/clients/booking.py` (`get_booking_mesh()`, `passthrough`, `download_passthrough`,
+`upstream_502`), `src/pa_bff/api/appointments.py`, `src/pa_bff/api/library.py`;
+Test `tests/api/test_booking.py`, дополнение `tests/core/…` на разбор ролей.
+
+Роутеры — 1-в-1 к §5.1/§5.2: путь `/api/appointments/x` → `/appointments/x`, query
+(вкл. `from`/`to`, `month`, `all`, `genre`, `state`) и JSON-тело — как есть; ответ —
+статус + тело без пересборки, 204 без тела; xlsx — `Content-Type` и
+`Content-Disposition` сервиса; сетевой сбой → 502.
+
+Тесты (FakeMesh, как `test_overtime.py`): путь/метод/параметры/тело на каждую ручку;
+409 с `{"detail","code"}` доходит без изменений; 204; xlsx-заголовки; 502;
+`X-User-Roles` несёт `psychologist`/`librarian` из токена (регресс на `_parse_roles`).
+
+### Task 4.2: SPA — data-слой
+
+**Files (frontend):** Create `src/lib/appointments.ts`, `src/lib/library.ts` (типы —
+зеркало схем сервиса, `fetch` через `authHeaders`/`apiError`, скачивание xlsx),
+`src/lib/bookingUi.ts` (чистые функции: `hasExactRole(me, role)` — без admin,
+форматирование дат `dd.mm.yyyy`/`HH:MM`, разбор ввода времени «10:00, 11:30»,
+`orderBookUrl()` — `VITE_LIBRARY_ORDER_BOOK_URL`, только `https:`, иначе null);
+Tests `src/test/appointments.test.ts`, `src/test/library.test.ts`, `src/test/bookingUi.test.ts`.
+
+### Task 4.3: SPA — раздел «Записи к психологу / МКР»
+
+**Files:** Create `src/pages/appointments/{AppointmentsLayout,FreeSlots,MyAppointments,AdminSlots}.tsx`,
+`Appointments.css`; Modify `src/App.tsx` (маршруты `/appointments/*`),
+`src/lib/shellNavigation.ts` (пункт «Записи к психологу / МКР» всем); Tests `src/test/appointments*.test.tsx`.
+
+- «Свободные»: слоты на ~4 недели вперёд по датам; запись — выбор «Психолог» /
+  «Консультация МКР» → `POST`; на 409 `slot_unavailable` — перезапрос списка.
+- «Мои записи»: будущие, `cancelled_by_specialist` — с пометкой «Отменена
+  специалистом»; «Отменить» с подтверждением; на 14:00 подсказка не нужна — сервис
+  сам решает, слот освобождается или удаляется.
+- «Расписание» (только `psychologist`): месяц ± 3 дня, у занятых — ФИО и тип;
+  добавить слоты (дата + список времени, ответ `added/duplicates` показываем);
+  удалить слот с подтверждением; выгрузка «за месяц» / «за всё время».
+
+### Task 4.4: SPA — раздел «Библиотека»
+
+**Files:** Create `src/pages/library/{LibraryLayout,Catalog,MyLoans,AdminBooks,AdminLoans}.tsx`,
+`Library.css`; Modify `src/App.tsx`, `src/lib/shellNavigation.ts` (пункт «Библиотека»);
+`frontend/.env.example` (`VITE_LIBRARY_ORDER_BOOK_URL`); Tests `src/test/library*.test.tsx`.
+
+- «Каталог»: фильтр по жанрам, карточка (автор, описание, «свободна»),
+  «Забронировать»; ссылка «Заказать книгу» — если задан конфиг.
+- «Мои книги»: срок, просроченные выделены, «Продлить» (у просроченной кнопки нет —
+  сервис ответит 409), «Вернуть».
+- Только `librarian`: «Книги» (добавить/изменить/удалить, 409 `book_on_loan`
+  показываем текстом сервиса), «Выдачи» (на руках / просроченные, «Отметить
+  возврат»), выгрузка истории.
+
+Компонентные тесты (vitest + jsdom, как `availableShifts.test.tsx`): гейт вкладок
+(admin без роли вкладок не видит), запись/отмена зовут верные пути, текст ошибки 409
+из `detail`, бронь/продление/возврат, скрытая ссылка заказа без конфига.
+
+**Выкатка (вне кода):** env BFF `BFF_BOOKING_BASE_URL=http://booking-api:8000`,
+`BFF_BOOKING_API_KEY` = `PA_BOOKING_API_KEY`; роли `psychologist`/`librarian` — в
+auth через админку; `VITE_LIBRARY_ORDER_BOOK_URL` = `ORDER_BOOK_LINK` бота.
+
+**Прогоны (пользователь, в `pa_bff`):** `pytest tests/api/test_booking.py -q`, затем
+`cd frontend && npx vitest run && npm run build`.
 
 ## Блок 5. Скрипты переноса — скоуп
 
