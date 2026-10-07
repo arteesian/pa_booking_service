@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from pa_booking.db.models import AppointmentBooking, AppointmentSlot
 from pa_booking.domain.appointments import MSK, BookingStatus, Kind, text_cleanup
+from pa_booking.domain.identity import Channel
 from pa_booking.notify.botx import FakeNotifier
 from pa_booking.workers.appointments_cleanup import run_cleanup
 
@@ -51,7 +52,11 @@ def test_cleanup_removes_only_free_slots_of_today(db_session: Session) -> None:
     booked = _slot(db_session, time(18, 0))
     db_session.add(
         AppointmentBooking(
-            slot_id=booked.id, employee_id=uuid.uuid4(), kind=Kind.PSY, status=BookingStatus.ACTIVE
+            slot_id=booked.id,
+            user_huid=uuid.uuid4(),
+            channel=Channel.EXPRESS,
+            kind=Kind.PSY,
+            status=BookingStatus.ACTIVE,
         )
     )
     _slot(db_session, time(16, 0), date(2026, 10, 6))

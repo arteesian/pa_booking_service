@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from pa_booking.db.models import AppointmentBooking, AppointmentSlot
 from pa_booking.domain.appointments import BookingStatus, Kind
+from pa_booking.domain.identity import Channel
 
 pytestmark = pytest.mark.db
 
@@ -28,7 +29,13 @@ def _slot(session: Session, *, removed: bool = False) -> AppointmentSlot:
 
 def _booking(session: Session, slot: AppointmentSlot, status: BookingStatus) -> None:
     session.add(
-        AppointmentBooking(slot_id=slot.id, employee_id=uuid.uuid4(), kind=Kind.PSY, status=status)
+        AppointmentBooking(
+            slot_id=slot.id,
+            user_huid=uuid.uuid4(),
+            channel=Channel.EXPRESS,
+            kind=Kind.PSY,
+            status=status,
+        )
     )
     session.flush()
 
@@ -66,3 +73,4 @@ def test_enums_store_values_not_member_names(pg_engine: Engine) -> None:
         "cancelled_by_user",
         "cancelled_by_specialist",
     ]
+    assert enums["booking_channel"] == ["lk", "express"]

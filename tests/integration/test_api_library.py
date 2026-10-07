@@ -10,18 +10,24 @@ import pytest
 from openpyxl import load_workbook
 from sqlalchemy.orm import Session
 
-from pa_booking.db.models import DirectoryEmployee, LibraryBook
+from pa_booking.db.models import LibraryBook
 from pa_booking.domain.library import text_extended, text_loaned, text_returned
 from pa_booking.domain.moscow import MSK
 from pa_booking.notify.botx import FakeNotifier
-from tests.integration.conftest import ApiEnv, headers
+from tests.integration.conftest import (
+    LIB_ADMIN,
+    ApiEnv,
+    add_roster,
+    bot_headers,
+    lk_headers,
+)
 
 pytestmark = pytest.mark.db
 
 # «сейчас» по умолчанию — 05.10.2026 10:00 МСК (фикстура api)
 USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
 OTHER = uuid.UUID("22222222-2222-2222-2222-222222222222")
-LIB = uuid.UUID("44444444-4444-4444-4444-444444444444")
+LIB = LIB_ADMIN
 TITLE = "Мастер и Маргарита"
 
 
@@ -36,25 +42,28 @@ def add_book(db: Session, title: str = TITLE, genre: str = "Роман") -> int:
     return book.id
 
 
-def add_name(db: Session, employee_id: uuid.UUID, name: str) -> None:
-    db.add(DirectoryEmployee(employee_id=employee_id, full_name=name))
-    db.commit()
+def add_name(db: Session, huid: uuid.UUID, name: str) -> None:
+    add_roster(db, huid, name)
+
+
+def headers(huid: uuid.UUID) -> dict[str, str]:
+    return bot_headers(huid, module="library")
 
 
 def lib_headers() -> dict[str, str]:
-    return headers(user_id=LIB, roles="librarian")
+    return headers(LIB)
 
 
 def loan(api: ApiEnv, book_id: int, user: uuid.UUID = USER) -> httpx.Response:
-    return api.client.post(f"/library/books/{book_id}/loan", headers=headers(user_id=user))
+    return api.client.post(f"/library/books/{book_id}/loan", headers=headers(user))
 
 
 def act(api: ApiEnv, loan_id: int, action: str, user: uuid.UUID = USER) -> httpx.Response:
-    return api.client.post(f"/library/loans/{loan_id}/{action}", headers=headers(user_id=user))
+    return api.client.post(f"/library/loans/{loan_id}/{action}", headers=headers(user))
 
 
 def catalog(api: ApiEnv) -> list[dict[str, object]]:
-    r = api.client.get("/library/books", headers=headers(user_id=USER))
+    r = api.client.get("/library/books", headers=headers(USER))
     assert r.status_code == 200
     result: list[dict[str, object]] = r.json()
     return result
@@ -74,12 +83,21 @@ def catalog(api: ApiEnv) -> list[dict[str, object]]:
         ("GET", "/library/admin/export"),
     ],
 )
-def test_admin_endpoints_require_librarian(api: ApiEnv, method: str, path: str) -> None:
+@pytest.mark.parametrize("via", ["bot_not_admin", "lk_admin_huid"])
+def test_admin_endpoints_require_librarian_in_bot(
+    api: ApiEnv, db_session: Session, method: str, path: str, via: str
+) -> None:
+    # Админка — только из бота (Р-11): HUID библиотекаря из ЛК роли не даёт.
+    h = (
+        headers(USER)
+        if via == "bot_not_admin"
+        else lk_headers(add_roster(db_session, LIB, "Библиотекарь"))
+    )
     r = api.client.request(
         method,
         path,
         json={"genre": "Роман", "author": "А", "title": "Б", "description": "В"},
-        headers=headers(user_id=USER, roles="operator,admin,psychologist"),
+        headers=h,
     )
     assert r.status_code == 403
     assert r.json()["code"] == "forbidden"
@@ -141,8 +159,8 @@ def test_catalog_and_genres(api: ApiEnv, db_session: Session) -> None:
     add_book(db_session, "Гамма", genre="Детектив")
     loan(api, taken)
 
-    r = api.client.get("/library/books", params={"genre": "Роман"}, headers=headers(user_id=USER))
-    genres = api.client.get("/library/genres", headers=headers(user_id=USER))
+    r = api.client.get("/library/books", params={"genre": "Роман"}, headers=headers(USER))
+    genres = api.client.get("/library/genres", headers=headers(USER))
 
     assert [(b["id"], b["available"]) for b in r.json()] == [(free, True), (taken, False)]
     assert genres.json() == ["Детектив", "Роман"]
@@ -151,7 +169,7 @@ def test_catalog_and_genres(api: ApiEnv, db_session: Session) -> None:
 def test_notify_failure_keeps_loan(api: ApiEnv, db_session: Session) -> None:
     api.notifier = FakeNotifier(fail=True)
     assert loan(api, add_book(db_session)).status_code == 201
-    assert len(api.client.get("/library/loans/my", headers=headers(user_id=USER)).json()) == 1
+    assert len(api.client.get("/library/loans/my", headers=headers(USER)).json()) == 1
 
 
 # --- продление и возврат ---
@@ -190,7 +208,7 @@ def test_return_overdue_loan_frees_book(api: ApiEnv, db_session: Session) -> Non
     book_id = add_book(db_session)
     loan_id = loan(api, book_id).json()["id"]
     api.clock.now = day(20)
-    my = api.client.get("/library/loans/my", headers=headers(user_id=USER)).json()
+    my = api.client.get("/library/loans/my", headers=headers(USER)).json()
     assert [(m["id"], m["overdue"]) for m in my] == [(loan_id, True)]  # Д-3: видна
 
     r = act(api, loan_id, "return")
@@ -282,7 +300,7 @@ def test_admin_remove_free_book(api: ApiEnv, db_session: Session) -> None:
     )
 
     assert catalog(api) == []
-    assert api.client.get("/library/genres", headers=headers(user_id=USER)).json() == []
+    assert api.client.get("/library/genres", headers=headers(USER)).json() == []
     assert loan(api, book_id).status_code == 404
     r = api.client.patch(
         f"/library/admin/books/{book_id}", json={"title": "X"}, headers=lib_headers()

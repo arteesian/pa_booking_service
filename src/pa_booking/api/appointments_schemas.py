@@ -46,7 +46,7 @@ class SlotsAddedOut(BaseModel):
 
 class OverviewBookingOut(BaseModel):
     id: int
-    employee_id: uuid.UUID
+    user_huid: uuid.UUID
     full_name: str
     kind: Kind
 
@@ -60,3 +60,17 @@ class OverviewSlotOut(BaseModel):
 class OverviewDayOut(BaseModel):
     date: date
     slots: list[OverviewSlotOut]
+
+
+class CancelledBookingOut(BaseModel):
+    """Бронь, отменённая удалением слота: боту — чтобы написать человеку лично (Д-6)."""
+
+    id: int
+    user_huid: uuid.UUID
+    date: date
+    time: time
+    kind: Kind
+
+
+class SlotDeletedOut(BaseModel):
+    cancelled_booking: CancelledBookingOut | None

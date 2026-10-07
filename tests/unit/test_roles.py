@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-from pa_booking.domain.roles import Role, parse_roles
+import uuid
+
+from pa_booking.domain.identity import Channel
+from pa_booking.domain.roles import Role, roles_for
+
+ADMIN = uuid.uuid4()
 
 
-def test_parses_csv_and_drops_unknown() -> None:
-    assert parse_roles("psychologist, operator ,librarian") == {
-        Role.PSYCHOLOGIST,
-        Role.LIBRARIAN,
+def test_listed_huid_in_bot_channel_gets_module_role() -> None:
+    assert roles_for(Channel.EXPRESS, ADMIN, module="appointments", admin_huids={ADMIN}) == {
+        Role.PSYCHOLOGIST
+    }
+    assert roles_for(Channel.EXPRESS, ADMIN, module="library", admin_huids={ADMIN}) == {
+        Role.LIBRARIAN
     }
 
 
-def test_empty_header_means_no_roles() -> None:
-    assert parse_roles(None) == frozenset()
-    assert parse_roles("") == frozenset()
+def test_unlisted_or_missing_huid_has_no_roles() -> None:
+    assert roles_for(Channel.EXPRESS, uuid.uuid4(), module="library", admin_huids={ADMIN}) == set()
+    assert roles_for(Channel.EXPRESS, None, module="library", admin_huids={ADMIN}) == set()
 
 
-def test_admin_is_not_our_role() -> None:
-    """admin другие роли неявно не покрывает (CLAUDE.md): для нас его нет."""
-    assert parse_roles("admin") == frozenset()
+def test_lk_channel_never_gets_roles() -> None:
+    """Админки в ЛК нет (Р-11): даже HUID из списка роли не даёт."""
+    assert roles_for(Channel.LK, ADMIN, module="appointments", admin_huids={ADMIN}) == set()

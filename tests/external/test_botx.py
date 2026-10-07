@@ -6,7 +6,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from pa_booking.core.config import Settings
-from pa_booking.notify.botx import Module, make_notifier
+from pa_booking.domain.identity import Module
+from pa_booking.notify.botx import make_notifier
 
 pytestmark = pytest.mark.external
 

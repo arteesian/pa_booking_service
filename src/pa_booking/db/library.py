@@ -92,12 +92,12 @@ def lock_loan(session: Session, loan_id: int) -> LoanWithBook | None:
     return None if row is None else LoanWithBook(row[0], row[1])
 
 
-def my_loans(session: Session, employee_id: uuid.UUID) -> list[LoanWithBook]:
-    """Невозвращённые выдачи сотрудника, по сроку (просроченные тоже — Д-3)."""
+def my_loans(session: Session, huid: uuid.UUID) -> list[LoanWithBook]:
+    """Невозвращённые выдачи пользователя, по сроку (просроченные тоже — Д-3)."""
     rows = session.execute(
         select(LibraryLoan, LibraryBook)
         .join(LibraryBook, LibraryBook.id == LibraryLoan.book_id)
-        .where(LibraryLoan.employee_id == employee_id, LibraryLoan.returned_at.is_(None))
+        .where(LibraryLoan.user_huid == huid, LibraryLoan.returned_at.is_(None))
         .order_by(LibraryLoan.due_on, LibraryLoan.id)
     ).all()
     return [LoanWithBook(loan, b) for loan, b in rows]

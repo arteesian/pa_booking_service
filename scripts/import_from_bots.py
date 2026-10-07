@@ -1,13 +1,14 @@
-"""Разовый перенос из MySQL ботов в pa_booking_service (спека §7, план — блок 5).
+"""Перенос из MySQL ботов в pa_booking_service (спека §7, план — блоки 5 и 6.4).
 
     pip install -e ".[migrate]"
-    python scripts/import_from_bots.py slots [--kind <HUID>=<psy|mkr>] [--assign …] [--apply]
-    python scripts/import_from_bots.py books [--apply]
+    python scripts/import_from_bots.py slots [--kind <HUID>=<psy|mkr>] [--apply]
+    python scripts/import_from_bots.py books [--replace] [--apply]
 
 Без ``--apply`` — dry-run: только план и цифры. Источник читается только SELECT'ами.
-Сотрудник брони — по HUID из снимка ростера (учётка ``express`` в auth), тип — из
-однозначного комментария бота или ``--kind``; ``--assign`` — ручное переопределение.
-Подключения — из окружения (``.env``):
+Пользователь брони/выдачи — HUID бота как есть; тип записи — из однозначного
+комментария бота или ``--kind``. ``books --replace`` — перезалить каталог в окне
+переключения (отказ, если в сервисе уже есть выдачи). Подключения — из окружения
+(``.env``):
 
 - ``PA_BOOKING_MIGRATE_PSY_MYSQL_URL`` / ``PA_BOOKING_MIGRATE_LIBRARY_MYSQL_URL`` —
   ``mysql+pymysql://user:pass@host:3306/db`` (пользователь только на чтение);
@@ -19,13 +20,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from pa_booking.core.config import get_settings
-from pa_booking.db.directory import employees_by_huid
 from pa_booking.db.session import make_engine_from_settings
 from pa_booking.domain.moscow import today_msk
 from pa_booking.migrate.bots import (
@@ -33,8 +33,8 @@ from pa_booking.migrate.bots import (
     SlotRow,
     apply_books,
     apply_slots,
-    parse_assign,
     parse_kind,
+    plan_books,
     plan_slots,
 )
 
@@ -72,34 +72,24 @@ def _slots(args: argparse.Namespace, now: datetime) -> None:
             "SELECT date, time, user_huid, tg_id, comment FROM record_psy_pari ORDER BY id",
         )
     ]
-    engine = make_engine_from_settings(get_settings())
-    with Session(engine) as session:
-        huid_map = employees_by_huid(session)
-    plan = plan_slots(
-        rows,
-        today=today_msk(now),
-        assignments=[parse_assign(a) for a in args.assign],
-        huid_to_employee=huid_map,
-        kinds=dict(parse_kind(k) for k in args.kind),
-    )
+    plan = plan_slots(rows, today=today_msk(now), kinds=dict(parse_kind(k) for k in args.kind))
     print(f"Строк в record_psy_pari: {len(rows)}")
     print(f"Будущих свободных слотов: {len(plan.free)}")
-    print(f"Будущих занятых слотов: {len(plan.booked)} (HUID в ростере: {len(huid_map)})")
+    print(f"Будущих броней с HUID: {len(plan.booked)}")
     for b in plan.booked:
-        who = (
-            f"→ {b.assignment.employee_id} ({b.assignment.kind})"
-            if b.assignment
-            else "→ НЕ СОПОСТАВЛЕН"
-        )
-        who = f"{who} [{b.source}]"
+        kind = b.kind or "ТИП НЕ ПОНЯТЕН"
         print(
-            f"  {b.slot_date:%d.%m.%Y} {b.slot_time:%H:%M} huid={b.huid} tg_id={b.tg_id}"
-            f" комментарий={b.comment!r} {who}"
+            f"  {b.slot_date:%d.%m.%Y} {b.slot_time:%H:%M} huid={b.huid}"
+            f" комментарий={b.comment!r} → {kind} [{b.source}]"
         )
+    if plan.telegram:
+        print(f"Будущих броней Telegram (без HUID) — НЕ переносятся: {len(plan.telegram)}")
+        for t in plan.telegram:
+            print(f"  {t.slot_date:%d.%m.%Y} {t.slot_time:%H:%M} tg_id={t.tg_id}")
     if not args.apply:
         print("Dry-run: ничего не записано. Для записи — --apply.")
         return
-    with Session(engine) as session:
+    with Session(make_engine_from_settings(get_settings())) as session:
         result = apply_slots(session, plan, now=now)
         session.commit()
     print(f"Записано: слотов {result.added}, уже были {result.skipped}, броней {result.bookings}.")
@@ -107,21 +97,41 @@ def _slots(args: argparse.Namespace, now: datetime) -> None:
 
 def _books(args: argparse.Namespace, now: datetime) -> None:
     rows = [
-        BookRow(str(g or ""), str(a or ""), str(t or ""), str(d or ""))
-        for g, a, t, d in _read(
+        BookRow(
+            str(g or ""),
+            str(a or ""),
+            str(t or ""),
+            str(d or ""),
+            huid=None if huid is None else str(huid),
+            tg_id=None if tg is None else int(str(tg)),
+            start=start if isinstance(start, date) else None,
+            end=end if isinstance(end, date) else None,
+        )
+        for g, a, t, d, huid, tg, start, end in _read(
             LIBRARY_URL,
-            "SELECT genre, author, title, description FROM Library_books ORDER BY id",
+            "SELECT genre, author, title, description, user_huid, tg_id, start, `end`"
+            " FROM Library_books ORDER BY id",
         )
     ]
-    print(f"Книг в Library_books: {len(rows)}, жанров: {len({r.genre.strip() for r in rows})}")
-    print("Все книги переносятся свободными (выдачи не переносим — план, блок 5).")
+    plan = plan_books(rows)
+    print(f"Книг в Library_books: {len(plan.books)}, жанров: {len({b.genre for b in plan.books})}")
+    print(f"На руках (переносятся выдачами): {plan.loans}")
+    for b in plan.books:
+        if b.loan is not None:
+            print(f"  {b.title!r}: huid={b.loan.huid} {b.loan.starts_on} — {b.loan.due_on}")
+    if plan.telegram:
+        print(f"На руках у Telegram-пользователей — переносятся СВОБОДНЫМИ: {len(plan.telegram)}")
+        for title in plan.telegram:
+            print(f"  {title!r}")
+    if args.replace:
+        print("--replace: каталог в сервисе будет удалён и залит заново.")
     if not args.apply:
         print("Dry-run: ничего не записано. Для записи — --apply.")
         return
     with Session(make_engine_from_settings(get_settings())) as session:
-        count = apply_books(session, rows, now=now)
+        result = apply_books(session, plan, now=now, replace=args.replace)
         session.commit()
-    print(f"Записано книг: {count}.")
+    print(f"Записано: книг {result.books}, выдач {result.loans}.")
 
 
 def main() -> None:
@@ -129,11 +139,11 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
     sub = parser.add_subparsers(dest="what", required=True)
-    slots = sub.add_parser("slots", help="будущие слоты записей (+ сопоставленные брони)")
-    slots.add_argument("--assign", action="append", default=[], metavar="HUID=EMPLOYEE_ID:KIND")
+    slots = sub.add_parser("slots", help="будущие слоты записей и брони")
     slots.add_argument("--kind", action="append", default=[], metavar="HUID=KIND")
     slots.add_argument("--apply", action="store_true")
-    books = sub.add_parser("books", help="каталог книг")
+    books = sub.add_parser("books", help="каталог книг и выдачи на руках")
+    books.add_argument("--replace", action="store_true", help="перезалить непустой каталог")
     books.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 

@@ -1,5 +1,8 @@
 """Ручки записей к психологу и на консультацию МКР (спека §5.1).
 
+Пользователь — HUID в обоих каналах (§3.1): ``User`` — смотреть, ``Me`` — личные
+действия (нужен HUID), ``Psychologist`` — админка, только из бота.
+
 Порядок в каждой меняющей ручке: блокировки → правило домена → изменение →
 ``commit`` → уведомление фоновой задачей. Уведомление уходит только после коммита
 и операцию не откатывает (CLAUDE.md).
@@ -7,7 +10,6 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Callable, Iterable
 from datetime import date
 from itertools import groupby
@@ -20,15 +22,26 @@ from sqlalchemy.orm import Session
 from pa_booking.api.appointments_schemas import (
     BookingCreate,
     BookingOut,
+    CancelledBookingOut,
     DaySlotsOut,
     OverviewBookingOut,
     OverviewDayOut,
     OverviewSlotOut,
+    SlotDeletedOut,
     SlotOut,
     SlotsAddedOut,
     SlotsCreate,
 )
-from pa_booking.api.deps import DbSession, Now, Principal, PsychologistPrincipal
+from pa_booking.api.deps import (
+    DbSession,
+    Identified,
+    Now,
+    Principal,
+    admin,
+    identified,
+    principal,
+)
+from pa_booking.api.schemas import MeOut
 from pa_booking.core.config import Settings, get_settings
 from pa_booking.core.errors import ApiError
 from pa_booking.db import appointments as repo
@@ -53,8 +66,9 @@ from pa_booking.domain.appointments import (
     text_slot_removed,
     validate_new_slots,
 )
+from pa_booking.domain.identity import Module
 from pa_booking.export.xlsx import build_xlsx
-from pa_booking.notify.botx import Module, Notifier, make_notifier, notify_safely
+from pa_booking.notify.botx import Notifier, make_notifier, notify_safely
 
 MODULE: Module = "appointments"
 MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
@@ -72,6 +86,9 @@ def get_appointments_notifier(
 
 
 AppointmentsNotifier = Annotated[Notifier | None, Depends(get_appointments_notifier)]
+User = Annotated[Principal, Depends(principal(MODULE))]
+Me = Annotated[Identified, Depends(identified(MODULE))]
+Psychologist = Annotated[Identified, Depends(admin(MODULE))]
 
 
 def _by_date[T](items: Iterable[T], key: Callable[[T], date]) -> list[tuple[date, list[T]]]:
@@ -79,8 +96,8 @@ def _by_date[T](items: Iterable[T], key: Callable[[T], date]) -> list[tuple[date
     return [(d, list(group)) for d, group in groupby(items, key=key)]
 
 
-def _name(session: Session, employee_id: uuid.UUID) -> str:
-    return display_names(session, [employee_id])[employee_id]
+def _name(session: Session, booking: AppointmentBooking) -> str:
+    return display_names(session, [(booking.user_huid, booking.user_name)])[booking.user_huid]
 
 
 def _booking_out(booking: AppointmentBooking, slot: AppointmentSlot) -> BookingOut:
@@ -99,10 +116,15 @@ def _parse_month(month: str) -> tuple[int, int]:
     return int(year), int(mon)
 
 
+@router.get("/me", response_model=MeOut)
+def me(user: User) -> MeOut:
+    return MeOut(huid=user.huid, roles=sorted(user.roles))
+
+
 @router.get("/slots", response_model=list[DaySlotsOut])
 def list_free_slots(
     session: DbSession,
-    _principal: Principal,
+    _user: User,
     now: Now,
     date_from: Annotated[date, Query(alias="from")],
     date_to: Annotated[date, Query(alias="to")],
@@ -123,26 +145,28 @@ def list_free_slots(
 def create_booking(
     body: BookingCreate,
     session: DbSession,
-    principal: Principal,
+    user: Me,
     now: Now,
     notifier: AppointmentsNotifier,
     background: BackgroundTasks,
 ) -> BookingOut:
-    # Сначала сотрудник, потом слот: этот порядок блокировок — единственный, где
+    # Сначала пользователь, потом слот: этот порядок блокировок — единственный, где
     # берутся обе, поэтому взаимоблокировки нет.
-    repo.lock_employee(session, principal.employee_id)
+    repo.lock_user(session, user.huid)
     locked = repo.lock_slot(session, body.slot_id)
     if locked is None:
         raise ApiError(404, "not_found", "Слот не найден")
     slot = locked.slot
     active = repo.count_active_in_month(
-        session, principal.employee_id, slot.slot_date.year, slot.slot_date.month
+        session, user.huid, slot.slot_date.year, slot.slot_date.month
     )
     ensure_bookable(locked.state(), active_in_month=active, now=now)
 
     booking = AppointmentBooking(
         slot_id=slot.id,
-        employee_id=principal.employee_id,
+        user_huid=user.huid,
+        user_name=user.name,
+        channel=user.channel,
         kind=body.kind,
         status=BookingStatus.ACTIVE,
         created_at=now,
@@ -155,19 +179,17 @@ def create_booking(
         session.rollback()
         raise ApiError(409, "slot_unavailable", "Слот недоступен для записи") from exc
 
-    text = text_booked(
-        _name(session, principal.employee_id), slot.slot_date, slot.slot_time, body.kind
-    )
+    text = text_booked(_name(session, booking), slot.slot_date, slot.slot_time, body.kind)
     background.add_task(notify_safely, notifier, text, module=MODULE)
     return _booking_out(booking, slot)
 
 
 @router.get("/bookings/my", response_model=list[BookingOut])
-def my_bookings(session: DbSession, principal: Principal, now: Now) -> list[BookingOut]:
-    """Будущие записи (начало ≥ now): активные и отменённые специалистом."""
+def my_bookings(session: DbSession, user: Me, now: Now) -> list[BookingOut]:
+    """Будущие записи (начало ≥ now): активные и отменённые специалистом — из обоих каналов."""
     rows = repo.my_bookings(
         session,
-        principal.employee_id,
+        user.huid,
         [BookingStatus.ACTIVE, BookingStatus.CANCELLED_BY_SPECIALIST],
         since=now.astimezone(MSK).date(),
     )
@@ -182,7 +204,7 @@ def my_bookings(session: DbSession, principal: Principal, now: Now) -> list[Book
 def cancel_booking(
     booking_id: int,
     session: DbSession,
-    principal: Principal,
+    user: Me,
     now: Now,
     notifier: AppointmentsNotifier,
     background: BackgroundTasks,
@@ -190,7 +212,7 @@ def cancel_booking(
     not_found = ApiError(404, "not_found", "Запись не найдена")
     found = repo.find_booking(session, booking_id)
     # Чужая бронь — 404, а не 403: существование чужого не раскрываем.
-    if found is None or found.booking.employee_id != principal.employee_id:
+    if found is None or found.booking.user_huid != user.huid:
         raise not_found
     locked = repo.lock_slot(session, found.slot.id)
     # Под блокировкой бронь могла уже смениться (отменена или слот удалён специалистом).
@@ -206,7 +228,7 @@ def cancel_booking(
     session.commit()
 
     text = text_cancelled_by_user(
-        _name(session, principal.employee_id), slot.slot_date, slot.slot_time, booking.kind
+        _name(session, booking), slot.slot_date, slot.slot_time, booking.kind
     )
     background.add_task(notify_safely, notifier, text, module=MODULE)
     return _booking_out(booking, slot)
@@ -215,12 +237,14 @@ def cancel_booking(
 @router.get("/admin/slots", response_model=list[OverviewDayOut])
 def admin_overview(
     session: DbSession,
-    _principal: PsychologistPrincipal,
+    _admin: Psychologist,
     month: Annotated[str, Query(pattern=MONTH_PATTERN)],
 ) -> list[OverviewDayOut]:
     """Обзор месяца ± 3 дня: все неудалённые слоты, у занятых — ФИО и тип."""
     rows = repo.overview(session, *overview_range(*_parse_month(month)))
-    names = display_names(session, {r.booking.employee_id for r in rows if r.booking})
+    names = display_names(
+        session, [(r.booking.user_huid, r.booking.user_name) for r in rows if r.booking]
+    )
 
     def slot_out(r: repo.SlotWithBooking) -> OverviewSlotOut:
         b = r.booking
@@ -231,8 +255,8 @@ def admin_overview(
             if b is None
             else OverviewBookingOut(
                 id=b.id,
-                employee_id=b.employee_id,
-                full_name=names[b.employee_id],
+                user_huid=b.user_huid,
+                full_name=names[b.user_huid],
                 kind=b.kind,
             ),
         )
@@ -245,7 +269,7 @@ def admin_overview(
 
 @router.post("/admin/slots", response_model=SlotsAddedOut)
 def admin_add_slots(
-    body: SlotsCreate, session: DbSession, _principal: PsychologistPrincipal, now: Now
+    body: SlotsCreate, session: DbSession, _admin: Psychologist, now: Now
 ) -> SlotsAddedOut:
     times = validate_new_slots(body.date, body.times, now=now)
     added, duplicates = repo.add_slots(session, body.date, times, now=now)
@@ -253,15 +277,17 @@ def admin_add_slots(
     return SlotsAddedOut(added=added, duplicates=duplicates)
 
 
-@router.delete("/admin/slots/{slot_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/admin/slots/{slot_id}", response_model=SlotDeletedOut)
 def admin_delete_slot(
     slot_id: int,
     session: DbSession,
-    _principal: PsychologistPrincipal,
+    _admin: Psychologist,
     now: Now,
     notifier: AppointmentsNotifier,
     background: BackgroundTasks,
-) -> Response:
+) -> SlotDeletedOut:
+    """Удалить слот. Занятый будущий — бронь отменяется, и она в ответе: личное
+    сообщение человеку шлёт бот (Д-6)."""
     locked = repo.lock_slot(session, slot_id)
     if locked is None or locked.slot.removed_at is not None:
         raise ApiError(404, "not_found", "Слот не найден")
@@ -274,18 +300,25 @@ def admin_delete_slot(
         booking.cancelled_at = now
     session.commit()
 
-    if booking is not None:
-        text = text_slot_removed(
-            _name(session, booking.employee_id), slot.slot_date, slot.slot_time
+    if booking is None:
+        return SlotDeletedOut(cancelled_booking=None)
+    text = text_slot_removed(_name(session, booking), slot.slot_date, slot.slot_time)
+    background.add_task(notify_safely, notifier, text, module=MODULE)
+    return SlotDeletedOut(
+        cancelled_booking=CancelledBookingOut(
+            id=booking.id,
+            user_huid=booking.user_huid,
+            date=slot.slot_date,
+            time=slot.slot_time,
+            kind=booking.kind,
         )
-        background.add_task(notify_safely, notifier, text, module=MODULE)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    )
 
 
 @router.get("/admin/export", response_class=Response)
 def admin_export(
     session: DbSession,
-    _principal: PsychologistPrincipal,
+    _admin: Psychologist,
     month: Annotated[str | None, Query(pattern=MONTH_PATTERN)] = None,
     all_time: Annotated[bool, Query(alias="all")] = False,
 ) -> Response:
@@ -303,7 +336,7 @@ def admin_export(
         rows = repo.export_rows(session, None, None)
         suffix, title = "all", "Все записи"
 
-    names = display_names(session, {r.employee_id for r in rows if r.employee_id})
+    names = display_names(session, [(r.user_huid, r.user_name) for r in rows if r.user_huid])
     data = build_xlsx(
         title,
         EXPORT_HEADERS,
@@ -311,7 +344,7 @@ def admin_export(
             (
                 r.slot_date,
                 r.slot_time,
-                None if r.employee_id is None else names[r.employee_id],
+                None if r.user_huid is None else names[r.user_huid],
                 None if r.kind is None else KIND_TITLES[r.kind],
                 None if r.status is None else STATUS_TITLES[r.status],
             )

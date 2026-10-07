@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from pa_booking.db.models import LibraryBook, LibraryLoan
+from pa_booking.domain.identity import Channel
 
 pytestmark = pytest.mark.db
 
@@ -23,7 +24,8 @@ def _loan(s: Session, book: LibraryBook, *, returned: bool = False) -> None:
     s.add(
         LibraryLoan(
             book_id=book.id,
-            employee_id=uuid.uuid4(),
+            user_huid=uuid.uuid4(),
+            channel=Channel.LK,
             starts_on=date(2026, 10, 5),
             due_on=date(2026, 10, 12),
             returned_at=datetime.now(UTC) if returned else None,

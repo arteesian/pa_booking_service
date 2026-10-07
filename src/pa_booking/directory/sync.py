@@ -5,7 +5,11 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+import structlog
+
 from pa_booking.directory.roster import RosterPerson, RosterSnapshot
+
+log = structlog.get_logger(__name__)
 
 EXPRESS_SERVICE = "express"
 
@@ -32,5 +36,17 @@ def _row(person: RosterPerson) -> EmployeeRow:
         person.employee_id,
         person.name,
         person.dismissed,
-        person.service_accounts.get(EXPRESS_SERVICE),
+        normalize_huid(person.service_accounts.get(EXPRESS_SERVICE), person.employee_id),
     )
+
+
+def normalize_huid(raw: str | None, employee_id: uuid.UUID) -> str | None:
+    """HUID в каноническом виде (нижний регистр) — по нему ищут ``names_by_huid`` и
+    вход из ЛК. Не UUID — привязки нет (warning): лучше «не привязан», чем промах."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return str(uuid.UUID(raw.strip()))
+    except ValueError:
+        log.warning("roster_bad_express_huid", employee_id=str(employee_id), value=raw)
+        return None

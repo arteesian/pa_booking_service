@@ -10,7 +10,7 @@ import pytest
 from openpyxl import load_workbook
 from sqlalchemy.orm import Session
 
-from pa_booking.db.models import AppointmentSlot, DirectoryEmployee
+from pa_booking.db.models import AppointmentSlot
 from pa_booking.domain.appointments import (
     MSK,
     Kind,
@@ -19,14 +19,20 @@ from pa_booking.domain.appointments import (
     text_slot_removed,
 )
 from pa_booking.notify.botx import FakeNotifier
-from tests.integration.conftest import ApiEnv, headers
+from tests.integration.conftest import (
+    PSY_ADMIN,
+    ApiEnv,
+    add_roster,
+    bot_headers,
+    lk_headers,
+)
 
 pytestmark = pytest.mark.db
 
 TODAY = date(2026, 10, 5)  # «сейчас» по умолчанию — 05.10.2026 10:00 МСК
 USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
 OTHER = uuid.UUID("22222222-2222-2222-2222-222222222222")
-PSY = uuid.UUID("33333333-3333-3333-3333-333333333333")
+PSY = PSY_ADMIN
 
 
 def at(h: int, m: int = 0, d: date = TODAY) -> datetime:
@@ -40,16 +46,15 @@ def add_slot(db: Session, t: time = time(16, 0), d: date = TODAY) -> int:
     return slot.id
 
 
-def add_name(db: Session, employee_id: uuid.UUID, name: str) -> None:
-    db.add(DirectoryEmployee(employee_id=employee_id, full_name=name))
-    db.commit()
+def add_name(db: Session, huid: uuid.UUID, name: str) -> None:
+    add_roster(db, huid, name)
 
 
 def book(api: ApiEnv, slot_id: int, user: uuid.UUID = USER, kind: str = "psy") -> httpx.Response:
     return api.client.post(
         "/appointments/bookings",
         json={"slot_id": slot_id, "kind": kind},
-        headers=headers(user_id=user),
+        headers=bot_headers(user),
     )
 
 
@@ -57,29 +62,27 @@ def free_ids(api: ApiEnv, d: date = TODAY) -> list[int]:
     r = api.client.get(
         "/appointments/slots",
         params={"from": d.isoformat(), "to": d.isoformat()},
-        headers=headers(user_id=USER),
+        headers=bot_headers(USER),
     )
     assert r.status_code == 200
     return [s["id"] for day in r.json() for s in day["slots"]]
 
 
 def my(api: ApiEnv, user: uuid.UUID = USER) -> list[dict[str, object]]:
-    r = api.client.get("/appointments/bookings/my", headers=headers(user_id=user))
+    r = api.client.get("/appointments/bookings/my", headers=bot_headers(user))
     assert r.status_code == 200
     result: list[dict[str, object]] = r.json()
     return result
 
 
 def cancel(api: ApiEnv, booking_id: int, user: uuid.UUID = USER) -> httpx.Response:
-    return api.client.post(
-        f"/appointments/bookings/{booking_id}/cancel", headers=headers(user_id=user)
-    )
+    return api.client.post(f"/appointments/bookings/{booking_id}/cancel", headers=bot_headers(user))
 
 
 def admin_delete(api: ApiEnv, slot_id: int) -> httpx.Response:
     return api.client.delete(
         f"/appointments/admin/slots/{slot_id}",
-        headers=headers(user_id=PSY, roles="psychologist"),
+        headers=bot_headers(PSY),
     )
 
 
@@ -95,13 +98,17 @@ def admin_delete(api: ApiEnv, slot_id: int) -> httpx.Response:
         ("GET", "/appointments/admin/export?all=true"),
     ],
 )
-def test_admin_endpoints_require_psychologist(api: ApiEnv, method: str, path: str) -> None:
-    r = api.client.request(
-        method,
-        path,
-        json={"date": "2026-10-06", "times": ["16:00"]},
-        headers=headers(user_id=USER, roles="operator,admin,librarian"),
+@pytest.mark.parametrize("via", ["bot_not_admin", "lk_admin_huid"])
+def test_admin_endpoints_require_psychologist_in_bot(
+    api: ApiEnv, db_session: Session, method: str, path: str, via: str
+) -> None:
+    # Админка — только из бота (Р-11): HUID специалиста из ЛК роли не даёт.
+    h = (
+        bot_headers(USER)
+        if via == "bot_not_admin"
+        else lk_headers(add_roster(db_session, PSY, "Психолог"))
     )
+    r = api.client.request(method, path, json={"date": "2026-10-06", "times": ["16:00"]}, headers=h)
     assert r.status_code == 403
     assert r.json()["code"] == "forbidden"
 
@@ -119,7 +126,7 @@ def test_free_slots_hide_started_booked_and_group_by_date(api: ApiEnv, db_sessio
     r = api.client.get(
         "/appointments/slots",
         params={"from": "2026-10-05", "to": "2026-10-06"},
-        headers=headers(user_id=USER),
+        headers=bot_headers(USER),
     )
 
     assert r.json() == [
@@ -146,7 +153,7 @@ def test_booking_notifies_with_roster_name(api: ApiEnv, db_session: Session) -> 
     assert api.notifier.sent == [text_booked("Иванов Иван", TODAY, time(16, 0), Kind.MKR)]
 
 
-def test_booking_without_roster_name_uses_employee_id(api: ApiEnv, db_session: Session) -> None:
+def test_booking_without_roster_name_uses_huid(api: ApiEnv, db_session: Session) -> None:
     assert book(api, add_slot(db_session)).status_code == 201
     assert api.notifier.sent == [text_booked(str(USER), TODAY, time(16, 0), Kind.PSY)]
 
@@ -267,7 +274,7 @@ def test_admin_add_slots_reports_duplicates(api: ApiEnv, db_session: Session) ->
     r = api.client.post(
         "/appointments/admin/slots",
         json={"date": "2026-10-06", "times": ["17:00", "16:00", "17:00"]},
-        headers=headers(user_id=PSY, roles="psychologist"),
+        headers=bot_headers(PSY),
     )
     assert r.status_code == 200
     assert r.json() == {"added": ["17:00:00"], "duplicates": ["16:00:00"]}
@@ -277,7 +284,7 @@ def test_admin_add_slots_in_past_date_is_422(api: ApiEnv) -> None:
     r = api.client.post(
         "/appointments/admin/slots",
         json={"date": "2026-10-04", "times": ["16:00"]},
-        headers=headers(user_id=PSY, roles="psychologist"),
+        headers=bot_headers(PSY),
     )
     assert r.status_code == 422
     assert r.json()["code"] == "slot_date_in_past"
@@ -286,10 +293,21 @@ def test_admin_add_slots_in_past_date_is_422(api: ApiEnv) -> None:
 def test_admin_delete_booked_future_slot_cancels_booking(api: ApiEnv, db_session: Session) -> None:
     add_name(db_session, USER, "Иванов Иван")
     slot_id = add_slot(db_session)
-    book(api, slot_id)
+    booking_id = book(api, slot_id).json()["id"]
 
-    assert admin_delete(api, slot_id).status_code == 204
+    r = admin_delete(api, slot_id)
 
+    assert r.status_code == 200
+    # Бронь в ответе — боту, чтобы написать человеку лично (Д-6).
+    assert r.json() == {
+        "cancelled_booking": {
+            "id": booking_id,
+            "user_huid": str(USER),
+            "date": "2026-10-05",
+            "time": "16:00:00",
+            "kind": "psy",
+        }
+    }
     assert [b["status"] for b in my(api)] == ["cancelled_by_specialist"]
     assert free_ids(api) == []
     assert api.notifier.sent[-1] == text_slot_removed("Иванов Иван", TODAY, time(16, 0))
@@ -298,7 +316,8 @@ def test_admin_delete_booked_future_slot_cancels_booking(api: ApiEnv, db_session
 
 def test_admin_delete_free_slot_without_notification(api: ApiEnv, db_session: Session) -> None:
     slot_id = add_slot(db_session, time(9, 0))  # уже прошёл — свободный удалить можно
-    assert admin_delete(api, slot_id).status_code == 204
+    r = admin_delete(api, slot_id)
+    assert (r.status_code, r.json()) == (200, {"cancelled_booking": None})
     assert api.notifier.sent == []
 
 
@@ -323,7 +342,7 @@ def test_admin_overview_month_with_margin_and_names(api: ApiEnv, db_session: Ses
     r = api.client.get(
         "/appointments/admin/slots",
         params={"month": "2026-10"},
-        headers=headers(user_id=PSY, roles="psychologist"),
+        headers=bot_headers(PSY),
     )
 
     assert r.status_code == 200
@@ -336,7 +355,7 @@ def test_admin_overview_month_with_margin_and_names(api: ApiEnv, db_session: Ses
                     "time": "16:00:00",
                     "booking": {
                         "id": booking_id,
-                        "employee_id": str(USER),
+                        "user_huid": str(USER),
                         "full_name": "Иванов Иван",
                         "kind": "mkr",
                     },
@@ -351,7 +370,7 @@ def test_admin_overview_rejects_bad_month(api: ApiEnv) -> None:
     r = api.client.get(
         "/appointments/admin/slots",
         params={"month": "2026-13"},
-        headers=headers(user_id=PSY, roles="psychologist"),
+        headers=bot_headers(PSY),
     )
     assert r.status_code == 422
 
@@ -363,7 +382,7 @@ def export(api: ApiEnv, **params: str) -> httpx.Response:
     return api.client.get(
         "/appointments/admin/export",
         params=params,
-        headers=headers(user_id=PSY, roles="psychologist"),
+        headers=bot_headers(PSY),
     )
 
 

@@ -21,6 +21,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from pa_booking.domain.appointments import BookingStatus, Kind
+from pa_booking.domain.identity import Channel
 
 
 class Base(DeclarativeBase):
@@ -89,7 +90,11 @@ class AppointmentSlot(Base):
 
 
 class AppointmentBooking(Base):
-    """Бронь слота сотрудником. Отменённые остаются — для «Моих записей» и выгрузок."""
+    """Бронь слота. Отменённые остаются — для «Моих записей» и выгрузок.
+
+    Пользователь — HUID eXpress в обоих каналах (спека Р-8); ``user_name`` — снимок
+    имени на момент брони: для людей не из ростера другого источника ФИО нет.
+    """
 
     __tablename__ = "appointment_bookings"
 
@@ -97,7 +102,9 @@ class AppointmentBooking(Base):
     slot_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("appointment_slots.id"), nullable=False
     )
-    employee_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    user_huid: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    user_name: Mapped[str | None] = mapped_column(String(256))
+    channel: Mapped[Channel] = mapped_column(_pg_enum(Channel, "booking_channel"), nullable=False)
     kind: Mapped[Kind] = mapped_column(_pg_enum(Kind, "appointment_kind"), nullable=False)
     status: Mapped[BookingStatus] = mapped_column(
         _pg_enum(BookingStatus, "appointment_status"), nullable=False
@@ -115,7 +122,7 @@ class AppointmentBooking(Base):
             unique=True,
             postgresql_where=text("status = 'active'"),
         ),
-        Index("ix_appointment_bookings_employee", "employee_id", "status"),
+        Index("ix_appointment_bookings_user_huid", "user_huid", "status"),
     )
 
 
@@ -142,7 +149,9 @@ class LibraryLoan(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     book_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("library_books.id"), nullable=False)
-    employee_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    user_huid: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    user_name: Mapped[str | None] = mapped_column(String(256))
+    channel: Mapped[Channel] = mapped_column(_pg_enum(Channel, "booking_channel"), nullable=False)
     starts_on: Mapped[date] = mapped_column(nullable=False)
     due_on: Mapped[date] = mapped_column(nullable=False)
     returned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -162,8 +171,8 @@ class LibraryLoan(Base):
             postgresql_where=text("returned_at IS NULL"),
         ),
         Index(
-            "ix_library_loans_employee",
-            "employee_id",
+            "ix_library_loans_user_huid",
+            "user_huid",
             postgresql_where=text("returned_at IS NULL"),
         ),
     )

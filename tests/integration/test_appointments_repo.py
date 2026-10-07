@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from pa_booking.db import appointments as repo
 from pa_booking.db.models import AppointmentBooking, AppointmentSlot
 from pa_booking.domain.appointments import BookingStatus, Kind
+from pa_booking.domain.identity import Channel
 
 pytestmark = pytest.mark.db
 
@@ -30,10 +31,16 @@ def _book(
     slot: AppointmentSlot,
     status: BookingStatus = BookingStatus.ACTIVE,
     *,
-    employee_id: uuid.UUID = EMP,
+    user_huid: uuid.UUID = EMP,
+    user_name: str | None = None,
 ) -> AppointmentBooking:
     booking = AppointmentBooking(
-        slot_id=slot.id, employee_id=employee_id, kind=Kind.PSY, status=status
+        slot_id=slot.id,
+        user_huid=user_huid,
+        user_name=user_name,
+        channel=Channel.LK,
+        kind=Kind.PSY,
+        status=status,
     )
     s.add(booking)
     s.flush()
@@ -46,7 +53,7 @@ def test_count_active_in_month_counts_past_and_skips_cancelled(db_session: Sessi
     _book(db_session, _slot(db_session, date(2026, 10, 20)), BookingStatus.CANCELLED_BY_USER)
     _book(db_session, _slot(db_session, date(2026, 10, 21)), BookingStatus.CANCELLED_BY_SPECIALIST)
     _book(db_session, _slot(db_session, date(2026, 11, 1)))  # другой месяц
-    _book(db_session, _slot(db_session, date(2026, 10, 22)), employee_id=uuid.uuid4())
+    _book(db_session, _slot(db_session, date(2026, 10, 22)), user_huid=uuid.uuid4())
 
     assert repo.count_active_in_month(db_session, EMP, 2026, 10) == 2
     assert repo.count_active_in_month(db_session, EMP, 2026, 11) == 1
@@ -135,7 +142,7 @@ def test_export_rows_like_bot_plus_statuses(db_session: Session) -> None:
     _slot(db_session, d, time(9, 0))  # свободный
     _book(db_session, _slot(db_session, d, time(10, 0)))  # занят
     reopened = _slot(db_session, d, time(11, 0))  # отменён и снова свободен
-    _book(db_session, reopened, BookingStatus.CANCELLED_BY_USER, employee_id=other)
+    _book(db_session, reopened, BookingStatus.CANCELLED_BY_USER, user_huid=other, user_name="Борис")
     removed_booked = _slot(db_session, d, time(12, 0), removed=True)  # удалён специалистом
     _book(db_session, removed_booked, BookingStatus.CANCELLED_BY_SPECIALIST)
     _slot(db_session, d, time(13, 0), removed=True)  # удалён чисткой — не выгружается
@@ -143,12 +150,12 @@ def test_export_rows_like_bot_plus_statuses(db_session: Session) -> None:
 
     rows = repo.export_rows(db_session, date(2026, 10, 1), date(2026, 10, 31))
 
-    assert [(r.slot_time, r.employee_id, r.status) for r in rows] == [
-        (time(9, 0), None, None),
-        (time(10, 0), EMP, BookingStatus.ACTIVE),
-        (time(11, 0), other, BookingStatus.CANCELLED_BY_USER),
-        (time(11, 0), None, None),
-        (time(12, 0), EMP, BookingStatus.CANCELLED_BY_SPECIALIST),
+    assert [(r.slot_time, r.user_huid, r.user_name, r.status) for r in rows] == [
+        (time(9, 0), None, None, None),
+        (time(10, 0), EMP, None, BookingStatus.ACTIVE),
+        (time(11, 0), other, "Борис", BookingStatus.CANCELLED_BY_USER),
+        (time(11, 0), None, None, None),
+        (time(12, 0), EMP, None, BookingStatus.CANCELLED_BY_SPECIALIST),
     ]
     assert len(repo.export_rows(db_session, None, None)) == 6
 
@@ -169,8 +176,8 @@ def test_lock_slot_missing_returns_none(db_session: Session) -> None:
     assert repo.lock_slot(db_session, 999_999) is None
 
 
-def test_lock_employee_blocks_same_employee_only(db_session: Session, pg_engine: Engine) -> None:
-    repo.lock_employee(db_session, EMP)
+def test_lock_user_blocks_same_huid_only(db_session: Session, pg_engine: Engine) -> None:
+    repo.lock_user(db_session, EMP)
     key = text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))")
     with Session(pg_engine) as other:
         assert other.scalar(key, {"key": f"appointments:{EMP}"}) is False

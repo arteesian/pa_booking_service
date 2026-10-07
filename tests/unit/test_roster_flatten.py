@@ -53,3 +53,24 @@ def test_old_auth_without_service_accounts_still_parses() -> None:
     snap = RosterSnapshot.model_validate({"operators": [], "employees": [person]})
     (row,) = flatten(snap)
     assert row.express_huid is None
+
+
+def test_express_huid_is_normalized_or_dropped() -> None:
+    """Регистр HUID в auth не должен ломать поиск; не-UUID — «не привязан»."""
+    snap = RosterSnapshot(
+        employees=[
+            RosterPerson(
+                employee_id=A,
+                name="Анна",
+                dismissed=False,
+                service_accounts={"express": f" {H.upper()} "},
+            ),
+            RosterPerson(
+                employee_id=B, name="Борис", dismissed=False, service_accounts={"express": "huid?"}
+            ),
+        ],
+        operators=[],
+    )
+    rows = {r.employee_id: r for r in flatten(snap)}
+    assert rows[A].express_huid == H
+    assert rows[B].express_huid is None

@@ -33,7 +33,7 @@ class LoanOut(BaseModel):
 
 
 class AdminLoanOut(LoanOut):
-    employee_id: uuid.UUID
+    user_huid: uuid.UUID
     full_name: str
     returned_by_librarian: bool
 

@@ -1,13 +1,17 @@
-"""Роли сервиса (спека §3, Д-5).
+"""Роли сервиса (спека §3.1, Д-5, Р-10).
 
-Роли — множество без иерархии. ``admin`` в наш набор не входит и поэтому ничего
-здесь не открывает: записи к психологу — чувствительные данные, их видит только
-``psychologist`` (CLAUDE.md). Коды ролей — строковый контракт с ``pa_auth_service``.
+Роли — множество без иерархии. Источник — не токен, а HUID из ``*_ADMIN_HUIDS`` в
+env сервиса, и только в канале бота: админки в ЛК нет (Р-11). Записи к психологу —
+чувствительные данные, их видит только ``psychologist`` (CLAUDE.md).
 """
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Collection
 from enum import StrEnum
+
+from pa_booking.domain.identity import Channel, Module
 
 
 class Role(StrEnum):
@@ -15,12 +19,21 @@ class Role(StrEnum):
     LIBRARIAN = "librarian"
 
 
-_BY_VALUE: dict[str, Role] = {r.value: r for r in Role}
+# Админская роль модуля: её получает HUID из списка админов этого модуля.
+ADMIN_ROLE: dict[Module, Role] = {
+    "appointments": Role.PSYCHOLOGIST,
+    "library": Role.LIBRARIAN,
+}
 
 
-def parse_roles(raw: str | None) -> frozenset[Role]:
-    """CSV из ``X-User-Roles`` → наши роли; чужие роли отбрасываются молча."""
-    if not raw:
-        return frozenset()
-    found = (_BY_VALUE.get(part.strip()) for part in raw.split(","))
-    return frozenset(role for role in found if role is not None)
+def roles_for(
+    channel: Channel,
+    huid: uuid.UUID | None,
+    *,
+    module: Module,
+    admin_huids: Collection[uuid.UUID],
+) -> frozenset[Role]:
+    """Роли пользователя в модуле: админская — только в канале бота и по списку."""
+    if channel is Channel.EXPRESS and huid is not None and huid in admin_huids:
+        return frozenset({ADMIN_ROLE[module]})
+    return frozenset()

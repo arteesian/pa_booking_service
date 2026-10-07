@@ -16,7 +16,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
 from urllib.parse import urlparse
 
 import httpx
@@ -26,10 +26,9 @@ from pydantic import SecretStr
 
 from pa_booking.core.config import Settings
 from pa_booking.core.metrics import notify_failures_total
+from pa_booking.domain.identity import Module
 
 log = structlog.get_logger(__name__)
-
-Module = Literal["appointments", "library"]
 
 SYNC_NOTIFICATION_PATH = "/api/v4/botx/notifications/direct/sync"
 JWT_TTL_S = 60

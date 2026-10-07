@@ -26,7 +26,8 @@ pytest, ruff, mypy --strict.
 - Юнит-тесты по файлу гоняет исполнитель; `db`, `external` и полный прогон — пользователь
   (исполнитель даёт точную команду и ждёт вывод).
 - Время — `Europe/Moscow`; даты — `date`/`time`, не строки.
-- Ключ пользователя — `employee_id` (UUID из `X-User-Id`).
+- Ключ пользователя — HUID eXpress (`user_huid`); в ЛК — из ростера по `X-User-Id`
+  (с 2026-10-07, блоки 6–7; до этого — `employee_id`).
 - Префикс настроек — `PA_BOOKING_`; секреты — `SecretStr`.
 - Host-порта нет: только `pa_net`, алиас `booking-api`.
 - Модули `appointments` и `library` друг друга не импортируют.
@@ -2595,4 +2596,139 @@ CLI: `python scripts/import_from_bots.py slots [--assign …] [--apply]`,
 
 **Проверка на проде (пользователь):** dry-run обеих команд → цифры совпадают с
 фактами выше (15 + 1, 106) → `--apply`.
+
+## Блок 6. Два канала — сервис (2026-10-07)
+
+**Итог:** сервис принимает запросы из ЛК и из ботов, пользователь везде — HUID,
+роли — по `*_ADMIN_HUIDS`. Спека §3.1, §4, §5, Р-8…Р-11, Д-10.
+
+**Факты (2026-10-07):** на проде `appointment_bookings` и `library_loans` пусты,
+`library_books` — перенесён (106). Миграция 0005 по данным ничего не теряет.
+
+**Ключевые решения по коду:**
+- Аутентификация в два слоя. `core/auth.py` (без БД): ключ → `Caller(channel,
+  module | None, employee_id | None, huid | None, name | None)`. `api/deps.py` (с
+  БД): `Caller` → `Principal(channel, huid | None, name, roles)` — HUID из ростера
+  для ЛК, роли по `*_ADMIN_HUIDS` только в канале бота.
+- Зависимости — фабрики на модуль: `principal(module)` (смотреть слоты/каталог —
+  HUID может не быть), `identified(module)` (HUID обязателен, иначе 409
+  `express_not_linked`), `admin(module)` (канал бота + HUID в списке, иначе 403).
+  Ключ бота в чужом модуле → 401 уже в `principal(module)`.
+- «Мои записи/книги» без привязки — тоже 409 `express_not_linked`, а не пустой
+  список: иначе пользователь ЛК не узнает, почему не может записаться.
+- HUID нормализуется при синке ростера (`uuid.UUID(...)` → `str`, нижний регистр);
+  не-UUID → `None` + warning. Колонка `directory_employees.express_huid` остаётся
+  строкой.
+- `Channel(StrEnum)` — `domain/identity.py` (нужен моделям и auth, не зависит от БД).
+
+### Task 6.1: настройки, каналы, принципал
+
+**Files:** Modify `core/config.py`, `core/auth.py`, `api/deps.py`,
+`domain/roles.py`, `directory/sync.py`, `db/directory.py`, `.env.example`;
+Create `domain/identity.py`; Test `tests/unit/test_mesh_auth.py` (переписать),
+`tests/unit/test_config.py`, `tests/unit/test_roster_flatten.py`.
+
+- [x] Settings: `appointments_bot_api_key`, `library_bot_api_key` (`SecretStr`,
+  пусто — канал выключен); `appointments_admin_huids`, `library_admin_huids` (CSV
+  строкой; невалидный UUID → ошибка при старте). `admin_huids(module) -> frozenset[UUID]`.
+- [x] `authenticate`: сравнить ключ с каждым непустым (`compare_digest` на байтах);
+  ЛК — `X-User-Id` (UUID, иначе 401); бот — `X-User-Huid` (UUID, иначе 401),
+  `X-User-Name` → `unquote`, пусто → `None`. Чужие для канала заголовки игнорируются.
+- [x] `roles_for(caller, settings, module)`: ЛК → пусто; бот → роль модуля, если HUID в
+  списке. `parse_roles` удалить.
+- [x] `flatten`: нормализация HUID. `db/directory`: `huid_of(employee_id)`,
+  `names_by_huid(huids)`; `employees_by_huid` → удалить вместе с переносом (6.4).
+- [x] Тесты (unit, на мини-приложении как сейчас): каждый канал; ключ бота записей на
+  ручке библиотеки → 401; `X-User-Huid` с ключом ЛК не влияет; кириллица в
+  `X-User-Name`; роль только в канале бота; не-UUID HUID в ростере → `None`.
+
+### Task 6.2: модели и миграция 0005
+
+**Files:** Modify `db/models.py`; Create `alembic/versions/0005_user_huid.py`;
+Test `tests/integration/test_appointments_schema.py`, `test_library_schema.py`,
+`test_migrations.py` (`db`).
+
+- [x] `appointment_bookings`, `library_loans`: `user_huid uuid NOT NULL`,
+  `user_name varchar(256) NULL`, `channel` (`ENUM booking_channel`: `lk`, `express`)
+  `NOT NULL`; `employee_id` удалить; индексы `ix_*_employee` → `ix_*_user_huid`.
+- [x] upgrade: колонки nullable → `UPDATE … FROM directory_employees` (HUID по
+  `employee_id`, `channel = 'lk'`) → если остались строки без HUID — `RuntimeError`
+  со списком id → `NOT NULL` → drop `employee_id`. downgrade — обратно тем же путём
+  (нет сотрудника по HUID → ошибка).
+- [x] Тесты: схема (колонки, индексы); upgrade с бронью сотрудника с HUID —
+  переезжает; без HUID — миграция падает.
+
+### Task 6.3: репозитории и ручки
+
+**Files:** Modify `db/appointments.py`, `db/library.py`, `api/appointments.py`,
+`api/library.py`, `api/*_schemas.py`; Test `tests/integration/conftest.py`
+(`lk_headers`, `bot_headers`), `test_api_appointments.py`, `test_api_library.py`,
+`test_appointments_repo.py`, `test_library_repo.py`, `test_cleanup.py` (`db`).
+
+- [x] Репозитории: `employee_id` → `user_huid`; `lock_employee` → `lock_user(huid)`.
+- [x] Ручки: `Principal`-типы модуля (6.1); при создании брони/выдачи —
+  `user_huid`, `user_name` (бот — из заголовка, ЛК — ФИО из ростера), `channel`.
+- [x] Имена: `display_names(session, [(huid, snapshot)])` — ростер по HUID →
+  снимок → HUID. Схемы: `employee_id` → `user_huid` в `OverviewBookingOut`,
+  `AdminLoanOut`.
+- [x] `GET /appointments/me`, `GET /library/me` → `MeOut{huid: UUID | None, roles}`.
+- [x] `DELETE /appointments/admin/slots/{id}` → 200 `SlotDeletedOut{cancelled_booking:
+  CancelledBookingOut{user_huid, date, time, kind} | None}`.
+- [x] Тесты: из ЛК без HUID — слоты видны, запись 409 `express_not_linked`; общий
+  лимит 2 (ЛК) + 2 (бот) → пятая 409 в обоих каналах; бронь из бота видна в «моих»
+  из ЛК у того же человека; админская ручка из ЛК с HUID из списка → 403; имя из
+  `X-User-Name` в уведомлении для человека не из ростера; `cancelled_booking` в ответе
+  удаления; остальные тесты — на новые заголовки без изменения ожиданий.
+
+### Task 6.4: перенос
+
+**Files:** Modify `migrate/bots.py`, `scripts/import_from_bots.py`, `README.md`;
+Test `tests/unit/test_migrate_bots.py`, `tests/integration/test_migrate_apply.py` (`db`).
+
+- [x] `plan_slots(rows, *, today, kinds)`: бронь с HUID → `BookedSlot(huid, kind)`;
+  тип — `--kind` или однозначный комментарий, иначе «нужен --kind» (`--apply`
+  отказывается); только `tg_id` → `skipped_telegram`: слот не переносится
+  совсем (занятым без HUID его не сделать, свободным — специалист решит, что окно
+  пустое) и печатается в отчёт. `--assign`, `parse_assign`, `Assignment` удалить.
+- [x] `apply_slots`: бронь — `user_huid`, `channel = express`, `user_name` из ростера
+  (`names_by_huid`), иначе `None`.
+- [x] `apply_books(…, replace=False)`: при `replace` — отказ, если есть выдачи; иначе
+  `DELETE library_books` и вставка заново, одной транзакцией.
+- [x] Тесты: тип из комментария/`--kind`; неизвестный `--kind` HUID → ошибка;
+  Telegram-строка не переносится и попадает в отчёт; (`db`) бронь по HUID с именем из
+  ростера и без; `--replace` при пустых выдачах перезаливает, при непустых — отказ.
+
+**Отличия от плана (2026-10-07):**
+- 6.1: Settings отказывается стартовать, если ключи BFF/ботов совпадают (иначе ключ
+  BFF открыл бы `X-User-Huid`).
+- 6.4: книги на руках переносятся выдачами по HUID (к окну переключения в боте могут
+  быть книги на руках; свободными их забронировал бы другой). Только `tg_id` —
+  книга свободна, в отчёт. `employees_by_huid`, `names_by_id`, `clean_book` удалены.
+
+**Review focus:** HUID из `X-User-Huid` принимается только с ключом бота; ключ
+бота записей не открывает `/library/*`; ростер не синкнут → ЛК 409, бот работает;
+лимит считается по HUID через оба канала.
+
+**Прогоны (пользователь):** `python -m pytest -m db tests/integration -q` после 6.2–6.4.
+
+## Блок 7. Боты — клиенты API (2026-10-07)
+
+**Итог:** `psy_bot_v2` и `Library_bot` работают через `booking-api`, их MySQL
+не используется. Работа в репозиториях ботов; правила там — уточнить перед стартом
+(тестов в ботах сейчас нет).
+
+- **7.1 `psy_bot_v2`.** `database.py` → `booking_client.py` (httpx, заголовки §3.1,
+  ошибки → `detail`). Удалить `slot_cleanup.py`, `create_table`, `ADMIN_HUIDS`
+  (админ-меню — по `GET /appointments/me`), отправку в служебный чат, свои xlsx.
+  Тип — кнопками (Д-1). Личное сообщение об отмене специалистом — по
+  `cancelled_booking`. Даты на кнопках — из `date`/`time` сервиса.
+- **7.2 `Library_bot`.** Аналогично; плюс «Отметить возврат» в админке (Д-4,
+  решено 2026-10-07): список выдач на руках/просроченных →
+  `POST /library/admin/loans/{id}/return`.
+- **7.3 Docker.** Контейнеры ботов в `pa_net`, env `BOOKING_API_URL`,
+  `BOOKING_API_KEY`; DSN MySQL убрать.
+- **Блок 4 (pa_bff) — доработка:** убрать админские ручки из BFF и вкладки из SPA
+  (сделаны в `95702f6`/`7e456d1`), роли `PSYCHOLOGIST`/`LIBRARIAN` из `Role` BFF,
+  показ `express_not_linked`.
+- **Выкатка:** §8 спеки, окно переключения §7.
 

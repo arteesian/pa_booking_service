@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from alembic import command
@@ -18,8 +19,9 @@ from pa_booking.api.deps import get_now
 from pa_booking.api.library import get_library_notifier
 from pa_booking.app import create_app
 from pa_booking.core.config import Settings, get_settings
-from pa_booking.db.models import Base
+from pa_booking.db.models import Base, DirectoryEmployee
 from pa_booking.domain.appointments import MSK
+from pa_booking.domain.identity import Module
 from pa_booking.notify.botx import FakeNotifier
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,7 +60,11 @@ def db_session(pg_engine: Engine) -> Iterator[Session]:
         session.commit()
 
 
-API_KEY = "test-mesh-key"
+API_KEY = "test-mesh-key"  # BFF (ЛК)
+BOT_KEYS: dict[Module, str] = {"appointments": "test-psy-bot", "library": "test-lib-bot"}
+# HUID админов: специалист — записей, библиотекарь — библиотеки (спека §3.1).
+PSY_ADMIN = uuid.UUID("33333333-3333-3333-3333-333333333333")
+LIB_ADMIN = uuid.UUID("44444444-4444-4444-4444-444444444444")
 
 
 @dataclass
@@ -84,7 +90,15 @@ def api(pg_engine: Engine, db_session: Session) -> ApiEnv:
     app = create_app()
     app.state.sessionmaker = sessionmaker(bind=pg_engine, expire_on_commit=False)
     env = ApiEnv(TestClient(app), Clock(datetime(2026, 10, 5, 10, 0, tzinfo=MSK)), FakeNotifier())
-    app.dependency_overrides[get_settings] = lambda: Settings(_env_file=None, api_key=API_KEY)
+    settings = Settings(
+        _env_file=None,
+        api_key=API_KEY,
+        appointments_bot_api_key=BOT_KEYS["appointments"],
+        library_bot_api_key=BOT_KEYS["library"],
+        appointments_admin_huids=str(PSY_ADMIN),
+        library_admin_huids=str(LIB_ADMIN),
+    )
+    app.dependency_overrides[get_settings] = lambda: settings
     # Через env: тест может перевести часы или подменить notifier на падающий.
     app.dependency_overrides[get_now] = lambda: env.clock.now
     app.dependency_overrides[get_appointments_notifier] = lambda: env.notifier
@@ -92,5 +106,32 @@ def api(pg_engine: Engine, db_session: Session) -> ApiEnv:
     return env
 
 
-def headers(*, user_id: uuid.UUID, roles: str = "operator") -> dict[str, str]:
-    return {"X-API-Key": API_KEY, "X-User-Id": str(user_id), "X-User-Roles": roles}
+def lk_headers(employee_id: uuid.UUID) -> dict[str, str]:
+    """Запрос из ЛК: BFF шлёт employee_id, HUID сервис ищет в ростере."""
+    return {"X-API-Key": API_KEY, "X-User-Id": str(employee_id)}
+
+
+def bot_headers(
+    huid: uuid.UUID, *, module: Module = "appointments", name: str | None = None
+) -> dict[str, str]:
+    """Запрос из бота модуля: HUID и (необязательно) имя из eXpress."""
+    h = {"X-API-Key": BOT_KEYS[module], "X-User-Huid": str(huid)}
+    if name is not None:
+        h["X-User-Name"] = quote(name)
+    return h
+
+
+def add_roster(
+    db: Session, huid: uuid.UUID | None, name: str, employee_id: uuid.UUID | None = None
+) -> uuid.UUID:
+    """Сотрудник в снимке ростера (ЛК); ``huid=None`` — eXpress не привязан. → employee_id."""
+    employee_id = employee_id or uuid.uuid4()
+    db.add(
+        DirectoryEmployee(
+            employee_id=employee_id,
+            full_name=name,
+            express_huid=None if huid is None else str(huid),
+        )
+    )
+    db.commit()
+    return employee_id

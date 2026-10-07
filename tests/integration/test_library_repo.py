@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from pa_booking.db import library as repo
 from pa_booking.db.models import LibraryBook, LibraryLoan
+from pa_booking.domain.identity import Channel
 
 pytestmark = pytest.mark.db
 
@@ -35,11 +36,12 @@ def _loan(
     due_on: date = date(2026, 10, 12),
     *,
     returned_at: datetime | None = None,
-    employee_id: uuid.UUID = EMP,
+    user_huid: uuid.UUID = EMP,
 ) -> LibraryLoan:
     loan = LibraryLoan(
         book_id=book.id,
-        employee_id=employee_id,
+        user_huid=user_huid,
+        channel=Channel.EXPRESS,
         starts_on=due_on.replace(day=1),
         due_on=due_on,
         returned_at=returned_at,
@@ -94,7 +96,7 @@ def test_my_loans_include_overdue_exclude_returned_and_others(db_session: Sessio
     overdue = _loan(db_session, _book(db_session, "А"), date(2026, 10, 1))
     current = _loan(db_session, _book(db_session, "Б"), date(2026, 10, 12))
     _loan(db_session, _book(db_session, "В"), returned_at=datetime.now(UTC))
-    _loan(db_session, _book(db_session, "Г"), employee_id=uuid.uuid4())
+    _loan(db_session, _book(db_session, "Г"), user_huid=uuid.uuid4())
 
     assert [r.loan.id for r in repo.my_loans(db_session, EMP)] == [overdue.id, current.id]
 
