@@ -2717,18 +2717,85 @@ Test `tests/unit/test_migrate_bots.py`, `tests/integration/test_migrate_apply.py
 не используется. Работа в репозиториях ботов; правила там — уточнить перед стартом
 (тестов в ботах сейчас нет).
 
-- **7.1 `psy_bot_v2`.** `database.py` → `booking_client.py` (httpx, заголовки §3.1,
-  ошибки → `detail`). Удалить `slot_cleanup.py`, `create_table`, `ADMIN_HUIDS`
-  (админ-меню — по `GET /appointments/me`), отправку в служебный чат, свои xlsx.
-  Тип — кнопками (Д-1). Личное сообщение об отмене специалистом — по
-  `cancelled_booking`. Даты на кнопках — из `date`/`time` сервиса.
-- **7.2 `Library_bot`.** Аналогично; плюс «Отметить возврат» в админке (Д-4,
-  решено 2026-10-07): список выдач на руках/просроченных →
-  `POST /library/admin/loans/{id}/return`.
+### Task 7.1: `psy_bot_v2` — клиент API (2026-10-07)
+
+**Правила репозитория** (решение пользователя): как в `pa_booking` — `CLAUDE.md`,
+pytest, ruff, mypy, коммит `prefix(scope): …`, коммитит пользователь. Бот без
+тестов и типов: `mypy --strict` — на новые модули (`booking_client.py`,
+`views.py`), старый UI-код (`call.py`, `add_slot.py`, `button.py`) — `ruff` и
+постепенная типизация, без strict.
+
+**Сопоставление потоков бота с API (§5.1):**
+
+| Поток бота | Было (MySQL) | Стало |
+|---|---|---|
+| Главное меню | `ADMIN_HUIDS` | `GET /appointments/me` → кнопка «Администрирование», если `psychologist` |
+| Записаться: даты → время | `get_available_dates/times` | `GET /appointments/slots?from=сегодня&to=+365д`; в кнопках — `slot_id` |
+| Подтверждение | вопрос «психолог или МКР?» текстом | кнопки «Психолог» / «Консультация МКР» → `POST /bookings {slot_id, kind}` (Д-1) |
+| Лимит 4/мес | проверка до выбора времени | только ответ 409 `monthly_limit` на подтверждении (у сервиса нет «проверить лимит»; считать по «моим» нельзя — прошедшие активные в «мои» не входят) |
+| Мои записи / отмена | `get_upcoming_user_records`, `cancel_booking` | `GET /bookings/my` (отменённые специалистом — с пометкой, без кнопки отмены), `POST /bookings/{id}/cancel` |
+| Админ: добавить слоты | `add_record` по одному | даты месяца ± 3 (прошедшие не показываем — Д-8), занятые времена — из `GET /admin/slots?month=`; `POST /admin/slots {date, times}` → `added/duplicates` |
+| Админ: удалить слот | `delete_slot` + ЛС + чат | даты/слоты — из обзора месяца; `DELETE /admin/slots/{id}` → по `cancelled_booking` ЛС пользователю; 409 `slot_in_past` — текстом (Д-9) |
+| Выгрузки | pandas по MySQL | `GET /admin/export?month=` / `?all=true` → файл как есть |
+| Уведомления в чат | бот | **сервис**; `notify_group` и `NOTIFY_CHAT_ID` из бота уходят |
+| Чистка 14:00, `create_table` | бот | удаляются (`slot_cleanup.py`, `database.py`) |
+
+**Файлы:** Create `CLAUDE.md`, `pyproject.toml` (ruff, mypy, pytest; зависимости —
+по-прежнему `requirements.txt`, его читает Dockerfile; dev — `requirements-dev.txt`),
+`booking_client.py`, `views.py` (чистое форматирование: даты, списки записей),
+`tests/test_booking_client.py`, `tests/test_views.py`; Modify `call.py`,
+`add_slot.py`, `button.py`, `main.py`, `session.py`, `config.py`, `requirements.txt`
+(− `mysql-connector-python`, `pandas`, `xlsxwriter`; + `httpx`); Delete `database.py`,
+`slot_cleanup.py`.
+
+- [x] **7.1.1 Каркас:** `CLAUDE.md`, `pyproject.toml`, `requirements-dev.txt`.
+- [x] **7.1.2 `booking_client.py`:** `BookingClient(base_url, api_key, *, transport=None)`
+  на `httpx.AsyncClient`; `User(huid, name)` → заголовки `X-User-Huid`,
+  `X-User-Name` (percent-encoded). Методы 1-в-1 к §5.1 + `me`. Ответы — Pydantic-модели
+  (зеркало схем сервиса, как `roster.py` в сервисе: не импортируем код сервиса).
+  Ошибки: 4xx с `{detail, code}` → `BookingError(status, code, detail)`; сеть/5xx/
+  кривое тело → `BookingUnavailable`. Без повторов (не дублировать запись).
+- [x] **7.1.3 Тесты клиента** (`httpx.MockTransport`): путь, метод, query/тело,
+  заголовки (кириллица в имени), разбор ответов, 409 → `BookingError.code`,
+  500/сетевой сбой → `BookingUnavailable`, xlsx — байты.
+- [x] **7.1.4 `views.py` + тесты:** формат даты/времени, строка записи («Отменена
+  специалистом»), сообщения об ошибках по `code` с фолбэком на `detail`.
+- [x] **7.1.5 Переписать потоки** `call.py` / `add_slot.py` / `button.py` по таблице;
+  `BookingUnavailable` → «Сервис временно недоступен, попробуйте позже».
+- [x] **7.1.6 Убрать** `database.py`, `slot_cleanup.py`, `create_table`, `ADMIN_HUIDS`,
+  `NOTIFY_CHAT_ID`, `DB_*`; env `BOOKING_API_URL`, `BOOKING_API_KEY`.
+  Отличия (2026-10-07): `replies.py` (отправка вынесена из `call.py` — без
+  импортов внутри функций), `service.py` (клиент, `service_errors`, `button_data` →
+  «кнопка устарела» для кнопок старого бота); фоновые задачи «исчезающих» сообщений
+  держатся по сильной ссылке (RUF006).
+- [ ] **7.1.7 Проверка вживую (пользователь):** бот против `booking-api` на стенде —
+  запись, отмена, админка; команды и порядок дам.
+
+**Запуск на хосте** (пользователь, 2026-10-07): общий `/bots/docker-compose.yml` на
+`vm-csat01`, код смонтирован в `/app`, зависимости — при сборке образа. Выкатка:
+сервису `psy_bot_v2` (и `library_bot`) добавить `networks: {default: {}, pa_net: {}}`
+и в корень `networks: {pa_net: {external: true}}`; после `git pull` —
+`docker compose build psy_bot_v2 && docker compose up -d psy_bot_v2` (меняются
+зависимости). URL сервиса — `http://booking-api:8000`.
+
+- [x] **7.2 `Library_bot`** (2026-10-07) — по образцу 7.1: `CLAUDE.md`, `.gitignore`,
+  `pyproject.toml`, `library_client.py`, `views.py`, `service.py`, `replies.py`,
+  тесты (25). Кнопки — `book_id` / `loan_id` (старый бот клал id книги в `id` и для
+  брони). Просроченные в «Моих бронированиях» помечены, у них нет «Продлить», есть
+  «Вернуть» (Д-3). Админка: «Выдачи» → на руках / просроченные → «Отметить возврат»
+  (Д-4, решено 2026-10-07). Книги добавляются по одной POST'ом, отчёт — какие
+  сохранились. Удалены `database.py`, `ADMIN_HUIDS`, `NOTIFICATION_CHAT_ID`, `DB_*`,
+  зависимости `mysql-connector-python`, `openpyxl`; BOM в `requirements.txt` убран.
+  Редактирования/удаления книг в боте не было и нет (сервис умеет — по запросу).
 - **7.3 Docker.** Контейнеры ботов в `pa_net`, env `BOOKING_API_URL`,
   `BOOKING_API_KEY`; DSN MySQL убрать.
-- **Блок 4 (pa_bff) — доработка:** убрать админские ручки из BFF и вкладки из SPA
-  (сделаны в `95702f6`/`7e456d1`), роли `PSYCHOLOGIST`/`LIBRARIAN` из `Role` BFF,
-  показ `express_not_linked`.
+- [x] **Блок 4 (pa_bff) — доработка** (2026-10-07): BFF не проксирует `/admin/*`
+  (тест: 404/405, в меш ничего не уходит), `proxy_download` удалён; `Role` без
+  `psychologist`/`librarian`. SPA: удалены `ScheduleAdmin`/`BooksAdmin`/`LoansAdmin`,
+  их роуты, вкладки и функции data-слоя, `hasExactRole`, разбор времени и месяцев,
+  `saveFile`. `express_not_linked` показывается текстом сервиса через `codedError`
+  (тест). Пункты меню — последними из рабочих разделов, над внешними ссылками
+  (решение пользователя); пилотный гейт `canViewBooking` (только admin) снимается
+  в окне переключения.
 - **Выкатка:** §8 спеки, окно переключения §7.
 

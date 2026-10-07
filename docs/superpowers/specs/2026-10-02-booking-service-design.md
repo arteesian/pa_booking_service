@@ -378,6 +378,8 @@ library_loans
 
 **Порядок выкатки (пересмотрен 2026-10-07):**
 
+Пошаговый сценарий с командами и чек-листом проверки — `docs/cutover-two-channels.md`.
+
 1. Сервис: миграция 0005 (`employee_id` → `user_huid`, `user_name`, `channel`),
    ключи ботов и `*_ADMIN_HUIDS` в env, деплой.
 2. BFF + SPA: убрать админские ручки и вкладки, добавить `express_not_linked`.
