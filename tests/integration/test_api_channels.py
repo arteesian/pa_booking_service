@@ -14,9 +14,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from pa_booking.db.models import AppointmentBooking, AppointmentSlot, LibraryBook, LibraryLoan
-from pa_booking.domain.appointments import Kind, text_booked
+from pa_booking.domain.appointments import (
+    BookingStatus,
+    Kind,
+    text_booked,
+    text_cancelled_by_user,
+)
 from pa_booking.domain.identity import Channel
-from pa_booking.domain.library import text_loaned
+from pa_booking.domain.library import text_extended, text_loaned, text_returned
 from tests.integration.conftest import (
     BOT_KEYS,
     LIB_ADMIN,
@@ -158,6 +163,47 @@ def test_roster_name_wins_over_bot_header(api: ApiEnv, db_session: Session) -> N
     )
     assert api.notifier.sent == [text_loaned("Иванова Анна", "Мастер", date(2026, 10, 12))]
     assert r.status_code == 201
+
+
+def test_owner_action_fills_empty_name_snapshot(api: ApiEnv, db_session: Session) -> None:
+    # Перенос из MySQL бота: имён там нет, человек не из ростера — снимок пуст.
+    stranger = uuid.uuid4()
+    slot_id = add_slot(db_session)
+    booking = AppointmentBooking(
+        slot_id=slot_id,
+        user_huid=stranger,
+        user_name=None,
+        channel=Channel.EXPRESS,
+        kind=Kind.PSY,
+        status=BookingStatus.ACTIVE,
+        created_at=api.clock.now,
+    )
+    loan = LibraryLoan(
+        book_id=add_book(db_session),
+        user_huid=stranger,
+        user_name=None,
+        channel=Channel.EXPRESS,
+        starts_on=TODAY,
+        due_on=date(2026, 10, 12),
+        created_at=api.clock.now,
+    )
+    db_session.add_all([booking, loan])
+    db_session.commit()
+
+    psy = bot_headers(stranger, name="Сидоров Сидор")
+    lib = bot_headers(stranger, module="library", name="Сидоров Сидор")
+    assert api.client.post(f"/appointments/bookings/{booking.id}/cancel", headers=psy).is_success
+    assert api.client.post(f"/library/loans/{loan.id}/extend", headers=lib).is_success
+    assert api.client.post(f"/library/loans/{loan.id}/return", headers=lib).is_success
+
+    assert api.notifier.sent == [
+        text_cancelled_by_user("Сидоров Сидор", TODAY, time(16, 0), Kind.PSY),
+        text_extended("Сидоров Сидор", "Мастер", date(2026, 10, 19)),
+        text_returned("Сидоров Сидор", "Мастер", by_librarian=False),
+    ]
+    db_session.expire_all()
+    assert db_session.scalar(select(AppointmentBooking.user_name)) == "Сидоров Сидор"
+    assert db_session.scalar(select(LibraryLoan.user_name)) == "Сидоров Сидор"
 
 
 # --- ключи и роли ---

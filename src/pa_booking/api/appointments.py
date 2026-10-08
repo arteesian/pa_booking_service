@@ -219,6 +219,10 @@ def cancel_booking(
     if locked is None or locked.booking is None or locked.booking.id != booking_id:
         raise not_found
     booking, slot = locked.booking, locked.slot
+    # Снимок имени — свежий от владельца: у перенесённых из бота броней людей не из
+    # ростера он пуст, и в уведомлении был бы HUID.
+    if user.name:
+        booking.user_name = user.name
 
     effect = cancel_effect(slot.slot_date, slot.slot_time, now=now)
     booking.status = BookingStatus.CANCELLED_BY_USER

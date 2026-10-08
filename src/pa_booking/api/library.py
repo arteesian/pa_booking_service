@@ -217,11 +217,17 @@ def my_loans(session: DbSession, user: Me, now: Now) -> list[LoanOut]:
     return [_loan_out(r.loan, r.book, now=now, ratings=ratings) for r in rows]
 
 
-def _own_open_loan(session: Session, loan_id: int, huid: uuid.UUID) -> repo.LoanWithBook:
+def _own_open_loan(
+    session: Session, loan_id: int, huid: uuid.UUID, name: str | None
+) -> repo.LoanWithBook:
     locked = repo.lock_loan(session, loan_id)
     # Чужая или уже возвращённая — 404: существование чужого не раскрываем.
     if locked is None or locked.loan.user_huid != huid or locked.loan.returned_at is not None:
         raise ApiError(404, "not_found", "Бронь не найдена")
+    # Снимок имени — свежий от владельца: у перенесённых из бота выдач людей не из
+    # ростера он пуст, и в уведомлении был бы HUID.
+    if name:
+        locked.loan.user_name = name
     return locked
 
 
@@ -234,7 +240,7 @@ def extend_loan(
     notifier: LibraryNotifier,
     background: BackgroundTasks,
 ) -> LoanOut:
-    locked = _own_open_loan(session, loan_id, user.huid)
+    locked = _own_open_loan(session, loan_id, user.huid, user.name)
     locked.loan.due_on = extended_due(locked.loan.due_on, now=now)
     session.commit()
 
@@ -253,7 +259,7 @@ def return_loan(
     background: BackgroundTasks,
 ) -> LoanOut:
     """Возврат своей выдачи, в т.ч. просроченной (Д-3)."""
-    locked = _own_open_loan(session, loan_id, user.huid)
+    locked = _own_open_loan(session, loan_id, user.huid, user.name)
     locked.loan.returned_at = now
     session.commit()
 
