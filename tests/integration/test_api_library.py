@@ -81,6 +81,7 @@ def catalog(api: ApiEnv) -> list[dict[str, object]]:
         ("GET", "/library/admin/loans?state=active"),
         ("POST", "/library/admin/loans/1/return"),
         ("GET", "/library/admin/export"),
+        ("DELETE", "/library/admin/comments/1"),
     ],
 )
 @pytest.mark.parametrize("via", ["bot_not_admin", "lk_admin_huid"])

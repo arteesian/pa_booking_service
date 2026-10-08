@@ -13,6 +13,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Index,
+    SmallInteger,
     String,
     Text,
     func,
@@ -174,5 +175,57 @@ class LibraryLoan(Base):
             "ix_library_loans_user_huid",
             "user_huid",
             postgresql_where=text("returned_at IS NULL"),
+        ),
+    )
+
+
+class LibraryRating(Base):
+    """Оценка книги: одна на (книга, HUID), повторная — upsert (спека О-2)."""
+
+    __tablename__ = "library_ratings"
+
+    book_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("library_books.id"), primary_key=True
+    )
+    user_huid: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    user_name: Mapped[str | None] = mapped_column(String(256))
+    channel: Mapped[Channel] = mapped_column(_pg_enum(Channel, "booking_channel"), nullable=False)
+    score: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (CheckConstraint("score BETWEEN 1 AND 5", name="ck_library_ratings_score"),)
+
+
+class LibraryComment(Base):
+    """Комментарий в обсуждении книги. Удаление мягкое (автор или библиотекарь).
+
+    Колонка — ``body``: атрибут ``text`` перекрыл бы ``sqlalchemy.text`` в теле класса.
+    """
+
+    __tablename__ = "library_comments"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    book_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("library_books.id"), nullable=False)
+    user_huid: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    user_name: Mapped[str | None] = mapped_column(String(256))
+    channel: Mapped[Channel] = mapped_column(_pg_enum(Channel, "booking_channel"), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    removed_by_librarian: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+
+    __table_args__ = (
+        Index(
+            "ix_library_comments_book",
+            "book_id",
+            "created_at",
+            postgresql_where=text("removed_at IS NULL"),
         ),
     )

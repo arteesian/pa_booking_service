@@ -204,6 +204,9 @@ library_loans
 | Уведомления в чат | Бронь, продление, возврат (с пометкой, если отметил библиотекарь) |
 | Выгрузка xlsx | История выдач: книга, ФИО, начало, срок, дата возврата, кто отметил |
 
+Оценки и обсуждения книг (таблицы `library_ratings`, `library_comments`) — спека
+`2026-10-08-library-ratings-comments-design.md`.
+
 ### 4.3. Согласованные расхождения с ботами
 
 | # | Было в боте | Стало |
@@ -261,6 +264,9 @@ library_loans
 | GET | `/library/admin/loans?state=active\|overdue` | librarian | Выдачи |
 | POST | `/library/admin/loans/{id}/return` | librarian | Отметить возврат |
 | GET | `/library/admin/export` | librarian | xlsx истории |
+
+Оценки и обсуждения книг (2026-10-08) — отдельная спека
+`2026-10-08-library-ratings-comments-design.md`.
 
 ### 5.3. Поток запроса (пример: запись)
 

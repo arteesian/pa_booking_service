@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated
@@ -32,14 +33,19 @@ from pa_booking.api.library_schemas import (
     BookCreate,
     BookOut,
     BookUpdate,
+    CommentIn,
+    CommentOut,
     LoanOut,
+    RatingIn,
+    RatingOut,
 )
 from pa_booking.api.schemas import MeOut
 from pa_booking.core.config import Settings, get_settings
 from pa_booking.core.errors import ApiError
 from pa_booking.db import library as repo
 from pa_booking.db.directory import display_names
-from pa_booking.db.models import LibraryBook, LibraryLoan
+from pa_booking.db.library import NO_RATINGS, RatingSummary
+from pa_booking.db.models import LibraryBook, LibraryComment, LibraryLoan
 from pa_booking.domain.identity import Module
 from pa_booking.domain.library import (
     ensure_loanable,
@@ -80,7 +86,16 @@ class LoanState(StrEnum):
     OVERDUE = "overdue"
 
 
-def _book_out(book: LibraryBook, *, available: bool) -> BookOut:
+Ratings = Mapping[int, RatingSummary]
+
+
+def _ratings(session: Session, books: Iterable[LibraryBook]) -> dict[int, RatingSummary]:
+    """Сводки оценок для всех книг ответа — одним запросом."""
+    return repo.rating_summaries(session, (b.id for b in books))
+
+
+def _book_out(book: LibraryBook, *, available: bool, ratings: Ratings) -> BookOut:
+    rating = ratings.get(book.id, NO_RATINGS)
     return BookOut(
         id=book.id,
         genre=book.genre,
@@ -88,14 +103,16 @@ def _book_out(book: LibraryBook, *, available: bool) -> BookOut:
         title=book.title,
         description=book.description,
         available=available,
+        rating_avg=rating.avg,
+        rating_count=rating.count,
     )
 
 
-def _loan_out(loan: LibraryLoan, book: LibraryBook, *, now: datetime) -> LoanOut:
+def _loan_out(loan: LibraryLoan, book: LibraryBook, *, now: datetime, ratings: Ratings) -> LoanOut:
     open_ = loan.returned_at is None
     return LoanOut(
         id=loan.id,
-        book=_book_out(book, available=not open_),
+        book=_book_out(book, available=not open_, ratings=ratings),
         starts_on=loan.starts_on,
         due_on=loan.due_on,
         overdue=open_ and is_overdue(loan.due_on, now=now),
@@ -104,14 +121,22 @@ def _loan_out(loan: LibraryLoan, book: LibraryBook, *, now: datetime) -> LoanOut
 
 
 def _admin_loan_out(
-    loan: LibraryLoan, book: LibraryBook, full_name: str, *, now: datetime
+    loan: LibraryLoan, book: LibraryBook, full_name: str, *, now: datetime, ratings: Ratings
 ) -> AdminLoanOut:
     return AdminLoanOut(
-        **_loan_out(loan, book, now=now).model_dump(),
+        **_loan_out(loan, book, now=now, ratings=ratings).model_dump(),
         user_huid=loan.user_huid,
         full_name=full_name,
         returned_by_librarian=loan.returned_by_librarian,
     )
+
+
+def _require_live_book(session: Session, book_id: int) -> LibraryBook:
+    """Неудалённая книга для оценок и обсуждения; иначе 404."""
+    book = repo.live_book(session, book_id)
+    if book is None:
+        raise ApiError(404, "not_found", "Книга не найдена")
+    return book
 
 
 def _live_book(session: Session, book_id: int) -> repo.BookWithLoan:
@@ -144,8 +169,10 @@ def list_genres(session: DbSession, _user: User) -> list[str]:
 
 @router.get("/books", response_model=list[BookOut])
 def list_books(session: DbSession, _user: User, genre: str | None = None) -> list[BookOut]:
-    """Каталог: сначала свободные, потом по названию."""
-    return [_book_out(r.book, available=not r.on_loan) for r in repo.catalog(session, genre)]
+    """Каталог: сначала свободные, потом по названию; со сводкой оценок."""
+    rows = repo.catalog(session, genre)
+    ratings = _ratings(session, (r.book for r in rows))
+    return [_book_out(r.book, available=not r.on_loan, ratings=ratings) for r in rows]
 
 
 @router.post("/books/{book_id}/loan", status_code=status.HTTP_201_CREATED, response_model=LoanOut)
@@ -179,13 +206,15 @@ def loan_book(
 
     text = text_loaned(_name(session, loan), locked.book.title, due_on)
     background.add_task(notify_safely, notifier, text, module=MODULE)
-    return _loan_out(loan, locked.book, now=now)
+    return _loan_out(loan, locked.book, now=now, ratings=_ratings(session, [locked.book]))
 
 
 @router.get("/loans/my", response_model=list[LoanOut])
 def my_loans(session: DbSession, user: Me, now: Now) -> list[LoanOut]:
     """Невозвращённые выдачи из обоих каналов, просроченные помечены (Д-3)."""
-    return [_loan_out(r.loan, r.book, now=now) for r in repo.my_loans(session, user.huid)]
+    rows = repo.my_loans(session, user.huid)
+    ratings = _ratings(session, (r.book for r in rows))
+    return [_loan_out(r.loan, r.book, now=now, ratings=ratings) for r in rows]
 
 
 def _own_open_loan(session: Session, loan_id: int, huid: uuid.UUID) -> repo.LoanWithBook:
@@ -211,7 +240,7 @@ def extend_loan(
 
     text = text_extended(_name(session, locked.loan), locked.book.title, locked.loan.due_on)
     background.add_task(notify_safely, notifier, text, module=MODULE)
-    return _loan_out(locked.loan, locked.book, now=now)
+    return _loan_out(locked.loan, locked.book, now=now, ratings=_ratings(session, [locked.book]))
 
 
 @router.post("/loans/{loan_id}/return", response_model=LoanOut)
@@ -230,7 +259,96 @@ def return_loan(
 
     text = text_returned(_name(session, locked.loan), locked.book.title, by_librarian=False)
     background.add_task(notify_safely, notifier, text, module=MODULE)
-    return _loan_out(locked.loan, locked.book, now=now)
+    return _loan_out(locked.loan, locked.book, now=now, ratings=_ratings(session, [locked.book]))
+
+
+# --- оценки ---
+
+
+def _rating_out(session: Session, book_id: int, huid: uuid.UUID | None) -> RatingOut:
+    summary = repo.rating_summaries(session, [book_id]).get(book_id, NO_RATINGS)
+    mine = None if huid is None else repo.my_score(session, book_id, huid)
+    return RatingOut(avg=summary.avg, count=summary.count, mine=mine)
+
+
+@router.get("/books/{book_id}/rating", response_model=RatingOut)
+def book_rating(book_id: int, session: DbSession, user: User) -> RatingOut:
+    """Сводка оценок; ``mine`` — null, если HUID неизвестен (ЛК без привязки)."""
+    _require_live_book(session, book_id)
+    return _rating_out(session, book_id, user.huid)
+
+
+@router.put("/books/{book_id}/rating", response_model=RatingOut)
+def rate_book(book_id: int, body: RatingIn, session: DbSession, user: Me, now: Now) -> RatingOut:
+    """Поставить или изменить свою оценку (О-1, О-2)."""
+    _require_live_book(session, book_id)
+    repo.upsert_rating(
+        session,
+        book_id=book_id,
+        huid=user.huid,
+        name=user.name,
+        channel=user.channel,
+        score=body.score,
+        now=now,
+    )
+    session.commit()
+    return _rating_out(session, book_id, user.huid)
+
+
+# --- обсуждение ---
+
+
+def _comment_out(
+    comment: LibraryComment, names: Mapping[uuid.UUID, str], huid: uuid.UUID | None
+) -> CommentOut:
+    return CommentOut(
+        id=comment.id,
+        author_name=names[comment.user_huid],
+        text=comment.body,
+        created_at=comment.created_at,
+        mine=comment.user_huid == huid,
+    )
+
+
+@router.get("/books/{book_id}/comments", response_model=list[CommentOut])
+def list_comments(book_id: int, session: DbSession, user: User) -> list[CommentOut]:
+    """Обсуждение книги, новые сверху; ФИО — как в выгрузках (ростер → снимок → HUID)."""
+    _require_live_book(session, book_id)
+    rows = repo.book_comments(session, book_id)
+    names = display_names(session, [(c.user_huid, c.user_name) for c in rows])
+    return [_comment_out(c, names, user.huid) for c in rows]
+
+
+@router.post(
+    "/books/{book_id}/comments", status_code=status.HTTP_201_CREATED, response_model=CommentOut
+)
+def add_comment(
+    book_id: int, body: CommentIn, session: DbSession, user: Me, now: Now
+) -> CommentOut:
+    _require_live_book(session, book_id)
+    comment = LibraryComment(
+        book_id=book_id,
+        user_huid=user.huid,
+        user_name=user.name,
+        channel=user.channel,
+        body=body.text,
+        created_at=now,
+    )
+    session.add(comment)
+    session.commit()
+    names = display_names(session, [(comment.user_huid, comment.user_name)])
+    return _comment_out(comment, names, user.huid)
+
+
+@router.delete("/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_comment(comment_id: int, session: DbSession, user: Me, now: Now) -> Response:
+    """Удалить свой комментарий (мягко). Чужой или уже удалённый — 404."""
+    comment = repo.lock_comment(session, comment_id)
+    if comment is None or comment.removed_at is not None or comment.user_huid != user.huid:
+        raise ApiError(404, "not_found", "Комментарий не найден")
+    comment.removed_at = now
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- библиотекарь ---
@@ -241,7 +359,7 @@ def admin_add_book(body: BookCreate, session: DbSession, _admin: Librarian, now:
     book = LibraryBook(**body.model_dump(), created_at=now)
     session.add(book)
     session.commit()
-    return _book_out(book, available=True)
+    return _book_out(book, available=True, ratings={})
 
 
 @router.patch("/admin/books/{book_id}", response_model=BookOut)
@@ -253,7 +371,9 @@ def admin_update_book(
     for field, value in body.model_dump(exclude_none=True).items():
         setattr(locked.book, field, value)
     session.commit()
-    return _book_out(locked.book, available=not locked.on_loan)
+    return _book_out(
+        locked.book, available=not locked.on_loan, ratings=_ratings(session, [locked.book])
+    )
 
 
 @router.delete("/admin/books/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -262,6 +382,20 @@ def admin_remove_book(book_id: int, session: DbSession, _admin: Librarian, now: 
     locked = _live_book(session, book_id)
     ensure_removable(on_loan=locked.on_loan)
     locked.book.removed_at = now
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/admin/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+def admin_delete_comment(
+    comment_id: int, session: DbSession, _admin: Librarian, now: Now
+) -> Response:
+    """Модерация: любой неудалённый комментарий (О-4)."""
+    comment = repo.lock_comment(session, comment_id)
+    if comment is None or comment.removed_at is not None:
+        raise ApiError(404, "not_found", "Комментарий не найден")
+    comment.removed_at = now
+    comment.removed_by_librarian = True
     session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -275,7 +409,11 @@ def admin_loans(
 ) -> list[AdminLoanOut]:
     rows = repo.open_loans(session, overdue=state is LoanState.OVERDUE, today=today_msk(now))
     names = _names(session, rows)
-    return [_admin_loan_out(r.loan, r.book, names[r.loan.user_huid], now=now) for r in rows]
+    ratings = _ratings(session, (r.book for r in rows))
+    return [
+        _admin_loan_out(r.loan, r.book, names[r.loan.user_huid], now=now, ratings=ratings)
+        for r in rows
+    ]
 
 
 @router.post("/admin/loans/{loan_id}/return", response_model=AdminLoanOut)
@@ -298,7 +436,9 @@ def admin_return_loan(
     name = _name(session, locked.loan)
     text = text_returned(name, locked.book.title, by_librarian=True)
     background.add_task(notify_safely, notifier, text, module=MODULE)
-    return _admin_loan_out(locked.loan, locked.book, name, now=now)
+    return _admin_loan_out(
+        locked.loan, locked.book, name, now=now, ratings=_ratings(session, [locked.book])
+    )
 
 
 @router.get("/admin/export", response_class=Response)
