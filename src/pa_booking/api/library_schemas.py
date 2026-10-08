@@ -83,3 +83,4 @@ class CommentOut(BaseModel):
     text: str
     created_at: datetime
     mine: bool
+    edited: bool

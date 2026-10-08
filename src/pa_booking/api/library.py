@@ -307,7 +307,16 @@ def _comment_out(
         text=comment.body,
         created_at=comment.created_at,
         mine=comment.user_huid == huid,
+        edited=comment.edited_at is not None,
     )
+
+
+def _own_live_comment(session: Session, comment_id: int, huid: uuid.UUID) -> LibraryComment:
+    """Свой неудалённый комментарий под блокировкой; чужой или удалённый — 404."""
+    comment = repo.lock_comment(session, comment_id)
+    if comment is None or comment.removed_at is not None or comment.user_huid != huid:
+        raise ApiError(404, "not_found", "Комментарий не найден")
+    return comment
 
 
 @router.get("/books/{book_id}/comments", response_model=list[CommentOut])
@@ -343,12 +352,23 @@ def add_comment(
 @router.delete("/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_comment(comment_id: int, session: DbSession, user: Me, now: Now) -> Response:
     """Удалить свой комментарий (мягко). Чужой или уже удалённый — 404."""
-    comment = repo.lock_comment(session, comment_id)
-    if comment is None or comment.removed_at is not None or comment.user_huid != user.huid:
-        raise ApiError(404, "not_found", "Комментарий не найден")
+    comment = _own_live_comment(session, comment_id, user.huid)
     comment.removed_at = now
     session.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/comments/{comment_id}", response_model=CommentOut)
+def edit_comment(
+    comment_id: int, body: CommentIn, session: DbSession, user: Me, now: Now
+) -> CommentOut:
+    """Изменить текст своего комментария; дата публикации не меняется, ставится пометка."""
+    comment = _own_live_comment(session, comment_id, user.huid)
+    comment.body = body.text
+    comment.edited_at = now
+    session.commit()
+    names = display_names(session, [(comment.user_huid, comment.user_name)])
+    return _comment_out(comment, names, user.huid)
 
 
 # --- библиотекарь ---

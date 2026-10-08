@@ -214,3 +214,54 @@ def test_lk_without_huid_reads_but_cannot_write(api: ApiEnv, db_session: Session
     assert [c["mine"] for c in listing.json()] == [False]
     assert (put.status_code, put.json()["code"]) == (409, "express_not_linked")
     assert (post.status_code, post.json()["code"]) == (409, "express_not_linked")
+
+
+# --- правка своего комментария ---
+
+
+def edit_comment(api: ApiEnv, comment_id: int, text: str, user: uuid.UUID = USER) -> httpx.Response:
+    return api.client.patch(
+        f"/library/comments/{comment_id}", json={"text": text}, headers=headers(user)
+    )
+
+
+def test_edit_own_comment_marks_it_edited(api: ApiEnv, db_session: Session) -> None:
+    book_id = add_book(db_session)
+    created = post_comment(api, book_id, "Черновик", name="Иванов Иван").json()
+    assert created["edited"] is False
+
+    r = edit_comment(api, created["id"], "  Итог  ")
+
+    assert r.status_code == 200
+    assert (r.json()["text"], r.json()["edited"], r.json()["mine"]) == ("Итог", True, True)
+    # Тот же момент; запись зоны может отличаться (свежий объект — МСК, из БД — UTC).
+    published = datetime.fromisoformat(r.json()["created_at"])
+    assert published == datetime.fromisoformat(created["created_at"])
+    assert [(c["text"], c["edited"]) for c in comments(api, book_id)] == [("Итог", True)]
+
+
+def test_edit_others_or_removed_comment_is_404(api: ApiEnv, db_session: Session) -> None:
+    book_id = add_book(db_session)
+    comment_id = post_comment(api, book_id, "Моё").json()["id"]
+
+    assert edit_comment(api, comment_id, "Чужая правка", user=OTHER).status_code == 404
+    api.client.delete(f"/library/comments/{comment_id}", headers=headers(USER))
+    assert edit_comment(api, comment_id, "После удаления").status_code == 404
+    assert edit_comment(api, 999_999, "Нет такого").status_code == 404
+
+
+def test_edit_validates_text(api: ApiEnv, db_session: Session) -> None:
+    book_id = add_book(db_session)
+    comment_id = post_comment(api, book_id, "Текст").json()["id"]
+    assert edit_comment(api, comment_id, "   ").status_code == 422
+    assert edit_comment(api, comment_id, "я" * 2001).status_code == 422
+
+
+def test_lk_without_huid_cannot_edit(api: ApiEnv, db_session: Session) -> None:
+    book_id = add_book(db_session)
+    comment_id = post_comment(api, book_id, "Текст").json()["id"]
+    h = lk_headers(add_roster(db_session, None, "Без Привязки"))
+
+    r = api.client.patch(f"/library/comments/{comment_id}", json={"text": "Т"}, headers=h)
+
+    assert (r.status_code, r.json()["code"]) == (409, "express_not_linked")

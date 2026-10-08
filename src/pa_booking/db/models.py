@@ -202,7 +202,8 @@ class LibraryRating(Base):
 
 
 class LibraryComment(Base):
-    """Комментарий в обсуждении книги. Удаление мягкое (автор или библиотекарь).
+    """Комментарий в обсуждении книги. Удаление мягкое (автор или библиотекарь);
+    автор может править текст — ``edited_at`` помечает правку.
 
     Колонка — ``body``: атрибут ``text`` перекрыл бы ``sqlalchemy.text`` в теле класса.
     """
@@ -220,6 +221,7 @@ class LibraryComment(Base):
     )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     removed_by_librarian: Mapped[bool] = mapped_column(nullable=False, server_default=text("false"))
+    edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index(
